@@ -1,2 +1,2 @@
-# tree-of-science
-The Tree Of Science Repo
+# ArXiv RAG
+A RAG Agent for Compute Science papers from ArXiv
