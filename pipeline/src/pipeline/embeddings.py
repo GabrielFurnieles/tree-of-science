@@ -17,17 +17,21 @@ from decouple import config
 import polars as pl
 from dataclasses import dataclass
 from datetime import datetime
-import time
 from pathlib import Path
 from tqdm import tqdm
-from transformers import AutoTokenizer
 import tiktoken
 import asyncio
 import logging
+import string
+import secrets
 import json
 import os
+from typing import Generator
 
 from .utils import AsyncRateLimiter
+from .schemas import BatchCreate
+from .db.crud import JobRepository, BatchRepository
+from .db.database import get_session
 
 logging.basicConfig(
     level=logging.INFO, handlers=[RichHandler(rich_tracebacks=True, markup=True)]
@@ -46,24 +50,6 @@ MAX_BATCH_FILE_SIZE = (
 )  # 10GB According to Nebius batch inference API docs (converted to bytes)
 
 
-def _tokenize_batch(texts_chunk, model_name):
-    """Worker function to tokenize a chunk of texts."""
-    if model_name == "cl100k_base":
-        encoding = tiktoken.get_encoding(
-            model_name
-        )  # Default tokenizer. Estimated count
-    else:
-        encoding = tiktoken.encoding_for_model(model_name)
-
-    return [len(encoding.encode(t, allowed_special="all")) for t in texts_chunk]
-
-
-def _chunk_list(lst, chunk_size):
-    """Split list into chunks."""
-    for i in range(0, len(lst), chunk_size):
-        yield lst[i : i + chunk_size]
-
-
 @dataclass
 class EmbeddingRequest:
     request_id: int
@@ -79,17 +65,32 @@ class BatchRequest:
     token_count: int
 
 
+# Utility functions
+def tokenize_batch(texts_chunk: list, model_name: str) -> list[int]:
+    """Worker function to tokenize a chunk of texts."""
+    try:
+        encoding = tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    return [len(encoding.encode(t, allowed_special="all")) for t in texts_chunk]
+
+
+def chunk_list(lst: list, chunk_size: int) -> Generator[list[str]]:
+    """Split list into chunks of specified size."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i : i + chunk_size]
+
+
 def log_retry_attempt(retry_state: RetryCallState):
+    """Log retry attempts with relevant info"""
     exception = retry_state.outcome.exception()
-
-    # Get the function arguments to access batch information
-    args = retry_state.args
-    kwargs = retry_state.kwargs
-
-    # Extract batch from the arguments (batch is the first argument after self)
-    batch = args[1] if len(args) > 1 else kwargs.get("batch")
-
+    batch = (
+        retry_state.args[1]
+        if len(retry_state.args) > 1
+        else retry_state.kwargs.get("batch")
+    )
     wait_time = retry_state.next_action.sleep if retry_state.next_action else 0
+
     logger.warning(
         f"Batch {getattr(batch, 'batch_number', 'unknown')} with {len(batch.texts)} texts failed: {exception}. "
         f"Retrying in {wait_time:.2f} seconds... (Attempt {retry_state.attempt_number}/5)"
@@ -151,7 +152,10 @@ class VectorEmbeddings:
         logger.info(f"POST v1/embeddings for files: {files}")
 
         datestr = datetime.now().strftime("%Y%m%d-%H%M")
-        outputfile = f"./data/embedding-requests-{id}-{datestr}.jsonl"
+        outputfile = Path(
+            f"./data/embeddings/{id}/embedding-requests-{id}-{datestr}.jsonl"
+        )
+        outputfile.parent.mkdir(parents=True, exist_ok=True)
 
         with open(outputfile, "a+", encoding="utf-8") as fout:
             with OpenAI(
@@ -171,6 +175,20 @@ class VectorEmbeddings:
                         metadata={"description": f},
                     )
 
+                    d = batch_request.__dict__.copy()
+                    d["batch_id"] = d.pop("id")
+                    d.update(
+                        {
+                            f"request_{k}": v
+                            for k, v in d.pop("request_counts").__dict__.items()
+                        }
+                    )
+
+                    batch_db = BatchCreate(job_id=id, local_file_id=f, **d)
+
+                    with get_session() as db:
+                        BatchRepository.create_batch(db, batch_db)
+
                     logger.info(
                         f"Created batch request at https://api.tokenfactory.nebius.com/v1/ for {f}"
                     )
@@ -186,8 +204,9 @@ class VectorEmbeddings:
     ) -> list[str]:
         datestr = datetime.now().strftime("%Y%m%d-%H%M")
         file = Path(
-            f"./data/{self.model.split("/")[-1].lower()}-{id}-{datestr}-batch-{batch.batch_id}.jsonl"
+            f"./data/embeddings/{id}/batches/{self.model.split("/")[-1].lower()}-{id}-{datestr}-batch-{batch.batch_id}.jsonl"
         )
+        file.parent.mkdir(parents=True, exist_ok=True)
         file_size = 0
 
         files = []
@@ -256,7 +275,8 @@ class VectorEmbeddings:
         try:
             encoding = tiktoken.encoding_for_model(self.model)
         except:
-            encoding = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
+            encoding - tiktoken.get_encoding("cl100k_base")
+            # encoding = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
 
         console.print(
             Panel(
@@ -482,12 +502,13 @@ class VectorEmbeddings:
         else:
             texts = df[text_column].to_list()
 
-        id = int(time.monotonic())  # unique job identifier
-        batch_info = self.compute_embeddings_batch(id, texts)
+        logger.info(f"Found {len(texts)} texts!")
+        job = self._create_job()
+        logger.info(f"New Embedding Job {job.id} created for model{job.model}")
 
-        console.print("\n[bold]✨ Batch embeddings posted[/bold]")
+        self.compute_embeddings_batch(job.id, texts)
 
-        return batch_info
+        return job.id
 
     def get_embeddings_batch(self):
         pass
@@ -509,7 +530,7 @@ class VectorEmbeddings:
 
         # Chunk size: distribute work evenly across workers
         chunk_size = max(1, len(texts) // (max_workers * 4))
-        chunks = list(_chunk_list(texts, chunk_size))
+        chunks = list(chunk_list(texts, chunk_size))
 
         logger.info(
             f"Tokenizing {len(texts):,} texts using {max_workers} workers ({len(chunks)} chunks)..."
@@ -528,7 +549,7 @@ class VectorEmbeddings:
 
         # Use ProcessPoolExecutor for CPU-bound work
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            worker_fn = partial(_tokenize_batch, model_name=model_name)
+            worker_fn = partial(tokenize_batch, model_name=model_name)
             results = list(
                 tqdm(
                     executor.map(worker_fn, chunks),
@@ -541,3 +562,12 @@ class VectorEmbeddings:
         token_counts = [count for chunk_result in results for count in chunk_result]
 
         return token_counts
+
+    def _create_job(self):
+        with get_session() as db:
+            job = JobRepository.create_job(db, self.model)
+        return job
+
+    def _generate_id(self, length: int = 8):
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(length))

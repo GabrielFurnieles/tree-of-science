@@ -2,10 +2,17 @@ import typer
 from decouple import config
 from .etl import KaggleDatasetExtractor, ArxivDatasetTransformer
 from .embeddings import VectorEmbeddings
+from .db.crud import DBRepository
+from .db.database import engine
 
+# Initialize Typer app
 app = typer.Typer()
 
+# Create DB Tables if they don't exist
+DBRepository.create_db(engine)
 
+
+# Commands
 @app.command()
 def hello_pipeline():
     typer.echo("Hello pipeline!")
@@ -14,6 +21,12 @@ def hello_pipeline():
 @app.command()
 def bye_pipeline():
     typer.echo("Bye pipeline!")
+
+
+@app.command()
+def recreate_db():
+    DBRepository.recreate_db(engine)
+    typer.echo("🔮 Database recreated!")
 
 
 # TEST
@@ -51,11 +64,13 @@ def compute_embeddings():
 @app.command()
 def post_embeddings_batch():
     embeddings = VectorEmbeddings(model="Qwen/Qwen3-Embedding-8B")
-    embeddings.post_embeddings_batch(
-        file="./data/clean-arxiv-metadata-oai.parquet",
+    job_id = embeddings.post_embeddings_batch(
+        file="./data/interim/clean-arxiv-metadata-oai.parquet",
         text_column=["title", "abstract"],
     )
-    typer.echo("post-embeddings-batch finished!")
+    typer.echo(
+        f"\n[bold]✨ Batch embeddings posted.[/bold] You can check the requests info at get-job-status --id {job_id}"
+    )
 
 
 if __name__ == "__main__":
