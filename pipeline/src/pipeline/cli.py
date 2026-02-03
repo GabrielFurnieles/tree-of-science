@@ -1,4 +1,5 @@
 import typer
+from rich import print
 from decouple import config
 from .etl import KaggleDatasetExtractor, ArxivDatasetTransformer
 from .embeddings import VectorEmbeddings
@@ -15,18 +16,18 @@ DBRepository.create_db(engine)
 # Commands
 @app.command()
 def hello_pipeline():
-    typer.echo("Hello pipeline!")
+    print("Hello pipeline!")
 
 
 @app.command()
 def bye_pipeline():
-    typer.echo("Bye pipeline!")
+    print("Bye pipeline!")
 
 
 @app.command()
 def recreate_db():
     DBRepository.recreate_db(engine)
-    typer.echo("🔮 Database recreated!")
+    print("🔮 Database recreated!")
 
 
 # TEST
@@ -34,7 +35,7 @@ def recreate_db():
 def extract_dataset():
     extractor = KaggleDatasetExtractor(config("KAGGLE_USERNAME"), config("KAGGLE_KEY"))
     path = extractor.get_dataset(dataset="Cornell-University/arxiv", path="./data")
-    typer.echo(f"Files downloaded at: /{path}")
+    print(f"Files downloaded at: /{path}")
 
 
 # TEST
@@ -44,31 +45,18 @@ def clean_dataset():
         jsonfile="./data/arxiv-metadata-oai-snapshot.json"
     )
     clean_path = transformer.clean(outputfile="./data/clean-arxiv-metadata-oai.parquet")
-    typer.echo(f"Files created at: /{clean_path}")
-
-
-# TEST
-@app.command()
-def compute_embeddings():
-    embeddings = VectorEmbeddings(model="text-embedding-3-small")
-    df = embeddings.get_embeddings(
-        file="./data/clean-arxiv-metadata-oai.parquet",
-        text_column=["title", "abstract"],
-        max_concurrent_requests=10,
-    )
-    df.write_parquet("./data/embs-arxiv-metadata-oai.parquet", compression="zstd")
-    typer.echo(f"\nComputed embeddings for {len(df)} records!")
+    print(f"Files created at: /{clean_path}")
 
 
 # TEST
 @app.command()
 def post_embeddings_batch():
     embeddings = VectorEmbeddings(model="Qwen/Qwen3-Embedding-8B")
-    job_id = embeddings.post_embeddings_batch(
+    job_id = embeddings.encode_batch(
         file="./data/interim/clean-arxiv-metadata-oai.parquet",
         text_column=["title", "abstract"],
     )
-    typer.echo(
+    print(
         f"\n[bold]✨ Batch embeddings posted.[/bold] You can check the requests info at get-job-status --id {job_id}"
     )
 

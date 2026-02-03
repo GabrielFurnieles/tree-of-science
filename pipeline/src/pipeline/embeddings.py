@@ -6,8 +6,8 @@ from tenacity import (
     RetryError,
     RetryCallState,
 )
-from openai import AsyncOpenAI, OpenAI, RateLimitError, APITimeoutError
-from openai.types import CreateEmbeddingResponse
+from openai import OpenAI
+from openai.types import Batch
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from rich.logging import RichHandler
@@ -20,16 +20,12 @@ from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 import tiktoken
-import asyncio
 import logging
-import string
-import secrets
 import json
 import os
-from typing import Generator
+from typing import Iterable
 
-from .utils import AsyncRateLimiter
-from .schemas import BatchCreate
+from .schemas import BatchCreate, BatchUpdate
 from .db.crud import JobRepository, BatchRepository
 from .db.database import get_session
 
@@ -56,6 +52,16 @@ class EmbeddingRequest:
     input: str | list[str]
     token_count: int
 
+    def to_json_line(self, job_id: int, batch_id: str, model: str, datestr: str) -> str:
+        """Serializes request into JSONL format required by the API"""
+        payload = {
+            "custom_id": f"batch-{job_id}-{datestr}_{batch_id}-request-{self.request_id}",
+            "method": "POST",
+            "url": "/v1/embeddings",
+            "body": {"model": model, "input": self.input},
+        }
+        return json.dumps(payload, ensure_ascii=False) + "/n"
+
 
 @dataclass
 class BatchRequest:
@@ -66,7 +72,7 @@ class BatchRequest:
 
 
 # Utility functions
-def tokenize_batch(texts_chunk: list, model_name: str) -> list[int]:
+def tokenize(texts_chunk: list, model_name: str) -> list[int]:
     """Worker function to tokenize a chunk of texts."""
     try:
         encoding = tiktoken.encoding_for_model(model_name)
@@ -75,26 +81,26 @@ def tokenize_batch(texts_chunk: list, model_name: str) -> list[int]:
     return [len(encoding.encode(t, allowed_special="all")) for t in texts_chunk]
 
 
-def chunk_list(lst: list, chunk_size: int) -> Generator[list[str]]:
+def chunk_list(lst: list, chunk_size: int) -> Iterable[list[str]]:
     """Split list into chunks of specified size."""
     for i in range(0, len(lst), chunk_size):
         yield lst[i : i + chunk_size]
 
 
-def log_retry_attempt(retry_state: RetryCallState):
-    """Log retry attempts with relevant info"""
-    exception = retry_state.outcome.exception()
-    batch = (
-        retry_state.args[1]
-        if len(retry_state.args) > 1
-        else retry_state.kwargs.get("batch")
-    )
-    wait_time = retry_state.next_action.sleep if retry_state.next_action else 0
+def map_openai_batch_to_dict(batch_request: Batch) -> dict:
+    """Maps an OpenAI Batch object to a flattened Python dictionary for DB schemas."""
 
-    logger.warning(
-        f"Batch {getattr(batch, 'batch_number', 'unknown')} with {len(batch.texts)} texts failed: {exception}. "
-        f"Retrying in {wait_time:.2f} seconds... (Attempt {retry_state.attempt_number}/5)"
-    )
+    payload = batch_request.model_dump(exclude={"id", "request_counts"})
+    payload["batch_id"] = batch_request.id
+
+    if batch_request.request_counts:
+        counts_dict = {
+            f"request_{k}": v
+            for k, v in batch_request.request_counts.model_dump().items()
+        }
+        payload.update(counts_dict)
+
+    return payload
 
 
 class VectorEmbeddings:
@@ -102,266 +108,127 @@ class VectorEmbeddings:
         self,
         model: str,
         max_input_tokens: int = MAX_INPUT_TOKENS,
-        max_requests_per_minute: int = MAX_REQUESTS_PER_MINUTE,
-        max_tokens_per_minute: int = MAX_TOKENS_PER_MINUTE,
     ):
         self.model = model
         self.max_input_tokens = max_input_tokens
 
-        self.request_limiter = AsyncRateLimiter(max_requests_per_minute, time_period=60)
-        self.tokens_limiter = AsyncRateLimiter(max_tokens_per_minute, time_period=60)
+    def _post_batch_api(self, id: int, file: str) -> None:
+        """Uploads the file and request batch embedding job to the API"""
 
-    @retry(
-        retry=retry_if_exception_type((RateLimitError, APITimeoutError)),
-        wait=wait_exponential(multiplier=1, min=4, max=60),
-        stop=stop_after_attempt(5),
-        before_sleep=log_retry_attempt,
-    )
-    async def get_embeddings_api(
-        self,
-        req: EmbeddingRequest,
-        client: AsyncOpenAI,
-        semaphore: asyncio.Semaphore,
-    ) -> tuple[int, CreateEmbeddingResponse]:
+        with OpenAI(
+            base_url="https://api.tokenfactory.nebius.com/v1/",
+            api_key=config("NEBIUS_API_KEY"),
+        ) as client:
 
-        await self.tokens_limiter.acquire(req.token_count)
+            # file_upload = client.files.create(
+            #     file=open(file, "rb"), purpose="batch"
+            # )
 
-        async with self.request_limiter:
+            # batch_request = client.batches.create(
+            #     input_file_id=file_upload.id,
+            #     endpoint="/v1/embeddings",
+            #     completion_window="24h",
+            # )
 
-            async with semaphore:
+            batch_request = client.batches.retrieve(
+                "batch_019c168e-6010-7a8b-96bf-5b30a3a40ee3"
+            )  # TODO. Remove after tests
 
-                logger.info(
-                    f"[yellow][Request {req.request_id}] Requesting embeddings for {len(req.input) if isinstance(req.input, list) else 1} texts with {self.model} model...[/]"
-                )
+            self._log_batch_request(id, batch_request, file)
 
-                try:
-                    response = await client.embeddings.create(
-                        input=req.input, model=self.model, encoding_format="float"
-                    )
+    def _get_batch_api(self, batch_id: str) -> Batch:
 
-                except RetryError as e:
-                    logger.error(
-                        f"All retries exhausted for batch {req.request_id} "
-                        f"with {len(req.input) if isinstance(req.input, list) else 1} texts. Final error: {e.last_attempt.exception()}"
-                    )
-                    response = e.last_attempt.exception()
+        with OpenAI(
+            base_url="https://api.tokenfactory.nebius.com/v1/",
+            api_key=config("NEBIUS_API_KEY"),
+        ) as client:
 
-                return (len(req.input) if isinstance(req.input, list) else 1, response)
+            return client.batches.retrieve(batch_id)
 
-    def post_embeddings_batch_api(self, id: int, files: list[str]) -> str:
-        logger.info(f"POST v1/embeddings for files: {files}")
-
-        datestr = datetime.now().strftime("%Y%m%d-%H%M")
-        outputfile = Path(
-            f"./data/embeddings/{id}/embedding-requests-{id}-{datestr}.jsonl"
-        )
-        outputfile.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(outputfile, "a+", encoding="utf-8") as fout:
-            with OpenAI(
-                base_url="https://api.tokenfactory.nebius.com/v1/",
-                api_key=config("NEBIUS_API_KEY"),
-            ) as client:
-
-                for f in files:
-                    file_upload = client.files.create(
-                        file=open(f, "rb"), purpose="batch"
-                    )
-
-                    batch_request = client.batches.create(
-                        input_file_id=file_upload.id,
-                        endpoint="/v1/embeddings",
-                        completion_window="24h",
-                        metadata={"description": f},
-                    )
-
-                    d = batch_request.__dict__.copy()
-                    d["batch_id"] = d.pop("id")
-                    d.update(
-                        {
-                            f"request_{k}": v
-                            for k, v in d.pop("request_counts").__dict__.items()
-                        }
-                    )
-
-                    batch_db = BatchCreate(job_id=id, local_file_id=f, **d)
-
-                    with get_session() as db:
-                        BatchRepository.create_batch(db, batch_db)
-
-                    logger.info(
-                        f"Created batch request at https://api.tokenfactory.nebius.com/v1/ for {f}"
-                    )
-
-                    d = batch_request.__dict__.copy()
-                    d["request_counts"] = d["request_counts"].__dict__
-                    fout.write(json.dumps(d) + "\n")
-
-        return outputfile
-
-    def create_batch_file(
+    def _create_batch_file(
         self, id: int, batch: BatchRequest, max_file_size: int = MAX_BATCH_FILE_SIZE
     ) -> list[str]:
+        """
+        Creates multiple JSONL files that represent the batch requests.
+        Each file has a maximum size allowed according to the API (OpenAI 200MB)
+        """
+
         datestr = datetime.now().strftime("%Y%m%d-%H%M")
-        file = Path(
-            f"./data/embeddings/{id}/batches/{self.model.split("/")[-1].lower()}-{id}-{datestr}-batch-{batch.batch_id}.jsonl"
-        )
+        base_name = f"{self.model.split("/")[-1].lower()}-{id}-{datestr}-batch-{batch.batch_id}.jsonl"
+        base_path = f"./data/embeddings/{id}/batches"
+        file = Path(f"{base_path}/{base_name}")
         file.parent.mkdir(parents=True, exist_ok=True)
-        file_size = 0
 
         files = []
-        file_handle = open(file, "w+", encoding="utf-8")
-        split_num = 2
+        current_file_size = 0
+        split_num = 1
 
-        subbatch_req_count = 0
-        subbatch_text_count = 0
-        subbatch_token_count = 0
+        f = open(file, "w+", encoding="utf-8")
 
-        logger.info(
-            f"Creating file/s for Batch #{batch.batch_id} with {len(batch.input)} requests... Total texts = {batch.text_count} tokens = {batch.token_count}."
-        )
+        try:
+            for req in batch.input:
+                line = req.to_json_line(id, batch.batch_id, self.model, datestr)
+                line_size = len(line.encode("utf-8"))
 
-        for req in batch.input:
-            request = {
-                "custom_id": f"batch-{id}-{datestr}_{batch.batch_id}-request-{req.request_id}",
-                "method": "POST",
-                "url": "/v1/embeddings",
-                "body": {"model": self.model, "input": req.input},
-            }
-
-            line = json.dumps(request, ensure_ascii=False) + "\n"
-            line_size = len(line.encode("utf-8"))
-
-            if file_size + line_size > max_file_size:
-                if file_handle:
-                    files.append(file_handle.name)
-                    file_handle.close()
-
+                if current_file_size + line_size > max_file_size:
+                    f.close()
+                    files.append(f.name)
                     logger.info(
-                        f"[yellow]✨ Created file {file_handle.name} for Batch #{batch.batch_id} with [bold]{subbatch_req_count}[/bold] requests...[/yellow] Total texts = {subbatch_text_count} tokens = {subbatch_token_count}."
+                        f"[yellow]✨ Created file {f.name} for Batch #{batch.batch_id}.[/]"
                     )
 
-                    subbatch_req_count = 0
-                    subbatch_text_count = 0
-                    subbatch_token_count = 0
+                    file_split = file.parent / f"{file.stem}_{split_num}.jsonl"
+                    f = open(file_split)
+                    current_file_size = 0
+                    split_num += 1
 
-                file_split = file.parent / f"{file.stem}_{split_num}.jsonl"
-                file_handle = open(file_split, "w+", encoding="utf-8")
+                f.write(line)
+                current_file_size += line_size
 
-                file_size = 0
-                split_num += 1
-
-            file_handle.write(line)
-            file_size += line_size
-
-            subbatch_req_count += 1
-            subbatch_text_count += len(req.input)
-            subbatch_token_count += req.token_count
-
-        if file_handle:
-            files.append(file_handle.name)
-            file_handle.close()
-            logger.info(
-                f"[yellow]✨ Created file {file_handle.name} for Batch #{batch.batch_id} with [bold]{subbatch_req_count}[/bold] requests...[/yellow] Total texts = {subbatch_text_count} tokens = {subbatch_token_count}."
-            )
+        finally:
+            if f:
+                f.close()
+                files.append(f.name)
+                logger.info(
+                    f"[yellow]✨ Created file {f.name} for Batch #{batch.batch_id}.[/]"
+                )
 
         return files
 
-    async def compute_embeddings_async(
-        self, texts: list[str], max_concurrent_requests: int
-    ) -> list[list[float]]:
-        semaphore = asyncio.Semaphore(max_concurrent_requests)
+    def _generate_embedding_request(
+        self, texts: list[str], counts: list[int]
+    ) -> Iterable[EmbeddingRequest]:
+        """
+        Generator function that create EmbeddingRequest objects according to the
+        maximum limit of tokens allowed per request (TPR)
+        """
 
-        try:
-            encoding = tiktoken.encoding_for_model(self.model)
-        except:
-            encoding - tiktoken.get_encoding("cl100k_base")
-            # encoding = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
+        logger.info("Batching requests...")
 
-        console.print(
-            Panel(
-                f"[bold cyan]Model:[/bold cyan] {self.model}\n"
-                f"[bold cyan]Total texts:[/bold cyan] {len(texts):,}\n"
-                f"[bold cyan]Max concurrent requests:[/bold cyan] {max_concurrent_requests}\n"
-                f"[bold cyan]Max tokens per request:[/bold cyan] {self.max_input_tokens:,}\n"
-                f"[bold cyan]Max requests per minute (RPM):[/bold cyan] {int(self.request_limiter.max_rate)}\n"
-                f"[bold cyan]Max tokens per minute (TPM):[/bold cyan] {int(self.tokens_limiter.max_rate)}\n",
-                title="[bold]Embedding Configuration[/bold]",
-                border_style="cyan",
-            )
-        )
+        current_input, current_count = [], 0
+        req_id = 1
 
-        async with AsyncOpenAI(
-            api_key=config("OPENAI_API_KEY"), max_retries=0
-        ) as client:
-            tasks = []
-            token_count = 0
-            model_input = []
-
-            for i, t in enumerate(texts, start=1):
-                n_tokens = self._token_len(t, encoding)
-                token_count += n_tokens
-
-                if token_count > self.max_input_tokens:
-                    logger.info(
-                        f"[yellow]Processing [bold]{i}/{len(texts)}[/bold] texts...[/yellow] Total texts = {len(model_input)} tokens = {token_count - n_tokens}"
-                    )
-                    tasks.append(
-                        self.get_embeddings_api(
-                            EmbeddingRequest(
-                                request_id=len(tasks) + 1,
-                                input=model_input,
-                                token_count=token_count - n_tokens,
-                            ),
-                            client,
-                            semaphore,
-                        )
-                    )
-
-                    # Reset batch
-                    token_count = n_tokens
-                    model_input = [t]
-
-                else:
-                    model_input.append(t)
-
-            if len(model_input):
-                tasks.append(
-                    self.get_embeddings_api(
-                        EmbeddingRequest(len(tasks) + 1, model_input, token_count),
-                        client,
-                        semaphore,
-                    )
+        for text, count in zip(texts, counts):
+            if current_count + count > self.max_input_tokens and current_input:
+                yield EmbeddingRequest(
+                    request_id=req_id, input=current_input, token_count=current_count
                 )
-                console.print(
-                    f"[yellow]Processing [bold]{i}/{len(texts)}[/bold] texts...[yellow] Total texts = {len(model_input)} tokens = {token_count}"
-                )
+                current_input, current_count = [], 0
+                req_id += 1
 
-            results: tuple[int, CreateEmbeddingResponse] = await asyncio.gather(
-                *tasks, return_exceptions=True
+            current_input.append(text)
+            current_count += count
+
+        if current_input:
+            yield EmbeddingRequest(
+                request_id=req_id, input=current_input, token_count=current_count
             )
 
-        embeddings = []
-        for i, response in enumerate(results):
-            n, embs = response
-            if isinstance(embs, Exception):
-                logging.error(
-                    f"❌ Batch [{i}/{len(results)}]. {n} texts failed with error: {embs}"
-                )
-                result = [-1 for _ in range(n)]  # Expand error to the affected records
-            else:
-                result = [e.embedding for e in embs.data]  # unpack embeddings
-            embeddings.extend(result)
-
-        return embeddings
-
-    def compute_embeddings_batch(self, id: int, texts: list[str]) -> str:
-        token_count = 0
-        request_input = []
-        batch_id = 1
-        batch_input = []
-        batch_text_count = 0
-        batch_token_count = 0
+    def _batch_texts(self, id: int, texts: list[str]) -> list[str]:
+        """
+        Takes a list of texts to embed and split them in multiple batches depending on
+        the API limits: Tokens Per Request > Requests Per Batch > Batch File Size
+        """
 
         console.print(
             Panel(
@@ -376,155 +243,47 @@ class VectorEmbeddings:
 
         logger.info(f"Pre-tokenizing texts for Rate Limits...")
 
-        # Pre-tokenization
-        token_counts = self.parallel_tokenize(texts)
+        # Pre-tokenization (parallel workers)
+        token_counts = self._tokenize_texts(texts)
 
-        logger.info(f"Batching requests...")
+        # Process texts into request objects
+        requests = list(self._generate_embedding_request(texts, token_counts))
 
-        for t, n_tokens in zip(texts, token_counts):
-            token_count += n_tokens
-
-            if token_count > self.max_input_tokens:
-                batch_input.append(
-                    EmbeddingRequest(
-                        request_id=len(batch_input) + 1,
-                        input=request_input,
-                        token_count=token_count - n_tokens,
-                    )
-                )
-                batch_text_count += len(request_input)
-                batch_token_count += token_count - n_tokens
-
-                # Reset request
-                token_count = n_tokens
-                request_input = [t]
-
-            else:
-                request_input.append(t)
-
-            if len(batch_input) >= MAX_REQUESTS_PER_BATCH:
-                batch_files = self.create_batch_file(
-                    id,
-                    BatchRequest(
-                        batch_id, batch_input, batch_text_count, batch_token_count
-                    ),
-                )
-                self.post_embeddings_batch_api(id, batch_files)
-
-                # Reset batch
-                batch_id += 1
-                batch_input = []
-                batch_text_count = 0
-                batch_token_count = 0
-
-        if len(request_input) > 0:
-            batch_input.append(
-                EmbeddingRequest(
-                    request_id=len(batch_input) + 1,
-                    input=request_input,
-                    token_count=token_count,
-                )
-            )
-            batch_text_count += len(request_input)
-            batch_token_count += token_count
-
-        if len(batch_input) > 0:
-            batch_files = self.create_batch_file(
+        # Process requests into batch files
+        request_files = [
+            self._create_batch_file(
                 id,
                 BatchRequest(
-                    batch_id, batch_input, batch_text_count, batch_token_count
+                    i,
+                    batch,
+                    sum(len(r.input) for r in batch),
+                    sum(r.token_count for r in batch),
                 ),
             )
-            self.post_embeddings_batch_api(id, batch_files)
-
-    def get_embeddings(
-        self,
-        file: str,
-        text_column: str | list[str],
-        max_concurrent_requests: int = 5,
-    ):
-        file = Path(file)
-
-        assert (
-            file.suffix == ".parquet"
-        ), f"Expected 'file' to be a .parquet file, instead got {file}"
-        assert file.exists(), f"Couldn't find the parquet file {file}"
-
-        logging.info(
-            f"Reading data from {file} 🔎\nThis may take a few seconds depending on the size of data..."
-        )
-
-        df = pl.read_parquet(file).head(10_000)  # TODO. Remove .head() for production
-
-        if isinstance(text_column, list):
-            texts = (
-                df.select(pl.concat_str(text_column, separator="\n\n"))
-                .to_series()
-                .to_list()
+            for i, batch in enumerate(
+                chunk_list(requests, MAX_REQUESTS_PER_BATCH), start=1
             )
-        else:
-            texts = df[text_column].to_list()
+        ]
 
-        emb: list[list[float]] = asyncio.run(
-            self.compute_embeddings_async(texts, max_concurrent_requests)
-        )
+        return [f for batch_files in request_files for f in batch_files]
 
-        df_emb = df.with_columns(pl.Series(name="embedding", values=emb))
-
-        console.print("\n[bold]✨ Embeddings Completed[/bold]")
-
-        return df_emb
-
-    def post_embeddings_batch(
-        self,
-        file: str,
-        text_column: str | list[str],
-    ):
-        file = Path(file)
-
-        assert (
-            file.suffix == ".parquet"
-        ), f"Expected 'file' to be a .parquet file, instead got {file}"
-        assert file.exists(), f"Couldn't find the parquet file {file}"
-
-        logging.info(
-            f"Reading data from {file} 🔎\nThis may take a few seconds depending on the size of data..."
-        )
-
-        df = pl.read_parquet(file).head(2_000)  # TODO. Remove .head() in prod
-
-        if isinstance(text_column, list):
-            texts = (
-                df.select(pl.concat_str(text_column, separator="\n\n"))
-                .to_series()
-                .to_list()
-            )
-        else:
-            texts = df[text_column].to_list()
-
-        logger.info(f"Found {len(texts)} texts!")
-        job = self._create_job()
-        logger.info(f"New Embedding Job {job.id} created for model{job.model}")
-
-        self.compute_embeddings_batch(job.id, texts)
-
-        return job.id
-
-    def get_embeddings_batch(self):
-        pass
-
-    def parallel_tokenize(self, texts: list[str], max_workers: int = None) -> list[int]:
+    def _log_batch_request(self, job_id: int, batch_request: Batch, local_file: str):
         """
-        Tokenize texts in parallel using multiprocessing.
-
-        Args:
-            texts: List of texts to tokenize
-            model_name: Model name for tiktoken encoding
-            max_workers: Number of worker processes (default: CPU count)
-
-        Returns:
-            List of token counts for each text
+        Takes a Batch request object from the OpenAI API and creates a new record in the local DB.
+        It leverages that Batch is a pydantic model.
         """
+
+        payload = map_openai_batch_to_dict(batch_request)
+        batch_db = BatchCreate(job_id=job_id, local_file_id=local_file, **payload)
+
+        with get_session() as db:
+            batch = BatchRepository.create_batch(db, batch_db)
+
+        logger.info(f"Created batch request {batch}")
+
+    def _tokenize_texts(self, texts: list[str], max_workers: int = None) -> list[int]:
+        """Tokenize texts in parallel using multiprocessing."""
+
         if max_workers is None:
             max_workers = os.cpu_count()
 
@@ -549,7 +308,7 @@ class VectorEmbeddings:
 
         # Use ProcessPoolExecutor for CPU-bound work
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            worker_fn = partial(tokenize_batch, model_name=model_name)
+            worker_fn = partial(tokenize, model_name=model_name)
             results = list(
                 tqdm(
                     executor.map(worker_fn, chunks),
@@ -563,11 +322,107 @@ class VectorEmbeddings:
 
         return token_counts
 
+    def _parse_texts(self, file: str, text_column: str | list[str]) -> list[str]:
+        """
+        Read texts from the .parquet file using polars and select columns
+        to create the final texts to embed.
+        """
+
+        logger.info(
+            f"Reading data from {file} 🔎\nThis may take a few seconds depending on the size of data..."
+        )
+
+        df = pl.read_parquet(file).head(2_000)  # TODO. Remove .head() in prod
+
+        if isinstance(text_column, list):
+            texts = (
+                df.select(pl.concat_str(text_column, separator="\n\n"))
+                .to_series()
+                .to_list()
+            )
+        else:
+            texts = df[text_column].to_list()
+
+        return texts
+
     def _create_job(self):
+        """Creates a new Job in DB"""
+
         with get_session() as db:
             job = JobRepository.create_job(db, self.model)
         return job
 
-    def _generate_id(self, length: int = 8):
-        alphabet = string.ascii_letters + string.digits
-        return "".join(secrets.choice(alphabet) for _ in range(length))
+    def encode_batch(
+        self,
+        file: str,
+        text_column: str | list[str],
+    ):
+        """
+        Chunks texts from a Parquet file and submits them for batch embedding.
+
+        Args:
+            file: Path to the Parquet file containing the data.
+            text_column: A single column name or a list of column names to embed.
+                Multiple columns are concatenated with double newlines ('\n\n').
+
+        Returns:
+            A list of paths to the generated batch request files.
+        """
+
+        f = Path(file)
+
+        assert (
+            f.suffix == ".parquet"
+        ), f"Expected 'file' to be a .parquet file, instead got {file}"
+        assert f.exists(), f"Couldn't find the parquet file {file}"
+
+        texts = self._parse_texts(file, text_column)
+        logger.info(
+            f"Found {len(texts)} texts! Creating new job to compute embeddings..."
+        )
+
+        job = self._create_job()
+        logger.info(f"New Job {job.id} created for model '{job.model}'")
+
+        batch_files = self._batch_texts(job.id, texts)
+
+        for batch_f in batch_files:
+            self._post_batch_api(job.id, batch_f)
+
+        return job.id
+
+    def check_status(self, job_id: int, refresh: bool = False) -> None:
+        # 1. Get job_id from db
+        # 2. Find all different batch_id from the job
+        # 3. Query openai API
+        # 4. Update jobs and batches in DB
+        # 5. Print message with the batch summary
+        # Repeat from 3. every minute if refresh = True
+
+        with get_session() as db:
+            batches = BatchRepository.get_batches(db, job_id)
+
+            upd_batches = []
+            for b in batches:
+                api_batch = self._get_batch_api(b.batch_id)
+                upd_batches.append(
+                    BatchRepository.update_batch(
+                        db, b.batch_id, BatchUpdate(map_openai_batch_to_dict(api_batch))
+                    )
+                )
+
+            job = JobRepository.update_job_status(db, job_id)
+
+            # TODO. Check CRUD operations work well
+            # TODO.Print message with status summary
+
+    def get_embeddings(self, job_id: int) -> str | None:
+        # 1. self.check_status
+        # 2. If job.status completed:
+        #   2.1 Get output files
+        #   2.2 Download files to local
+        #   2.3 Parse files
+        #   2.4 Create new file with all the data + embeddings
+        #   2.5 Return file
+        # 3. else: Print message and return None
+        pass

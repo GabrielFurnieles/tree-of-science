@@ -59,3 +59,24 @@ class BatchCreate(BaseModel):
         if isinstance(v, (int, float)):
             return datetime.fromtimestamp(v)
         return v
+
+
+class BatchUpdate(BaseModel):
+    status: Optional[BatchStatus] = None
+    output_file_id: Optional[str] = None
+    error_file_id: Optional[str] = None
+    request_completed: Optional[int] = None
+    request_failed: Optional[int] = None
+    request_total: Optional[int] = None
+    usage: Optional[Dict[str, Any]] = None
+    errors: Optional[str] = None
+    cancelled_at: Optional[datetime] = None
+    cancelling_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    failed_at: Optional[datetime] = None
+    finalizing_at: Optional[datetime] = None
+    in_progress_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}

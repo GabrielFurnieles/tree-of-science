@@ -129,4 +129,4 @@ class Batch(Base):
     job: Mapped["Job"] = relationship(back_populates="batches")
 
     def __repr__(self):
-        return f"<Batch(id={self.id}, batch_id='{self.batch_id}', status='{self.status.value if self.status else None}')>"
+        return f"<Batch(id={self.id}, batch_id='{self.batch_id}', status='{self.status.value if self.status else None}', local_file='{self.local_file_id}')>"
