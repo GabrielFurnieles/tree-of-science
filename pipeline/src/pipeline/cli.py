@@ -50,15 +50,26 @@ def clean_dataset():
 
 # TEST
 @app.command()
-def post_embeddings_batch():
-    embeddings = VectorEmbeddings(model="Qwen/Qwen3-Embedding-8B")
+def create_embeddings(model: str = "Qwen/Qwen3-Embedding-8B"):
+    embeddings = VectorEmbeddings()
     job_id = embeddings.encode_batch(
         file="./data/interim/clean-arxiv-metadata-oai.parquet",
         text_column=["title", "abstract"],
+        model=model,
     )
+
+    embeddings.check_status(job_id)
+
     print(
         f"\n[bold]✨ Batch embeddings posted.[/bold] You can check the requests info at get-job-status --id {job_id}"
     )
+
+
+# TEST
+@app.command()
+def check_status(job_id: int):
+    embeddings = VectorEmbeddings()
+    embeddings.check_status(job_id, refresh=True)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,19 @@
-from pydantic import BaseModel, Field, field_validator
-from datetime import datetime
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-from .db.models import BatchStatus
+from .db.models import JobStatus, BatchStatus
+
+
+class JobRead(BaseModel):
+    id: int
+    status: JobStatus
+    model: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+    def __repr__(self):
+        return f"<Job(id={self.id}, model='{self.model}', status='{self.status.value if self.status else None}')>"
 
 
 class BatchCreate(BaseModel):
@@ -40,7 +51,7 @@ class BatchCreate(BaseModel):
     finalizing_at: Optional[datetime] = None
     in_progress_at: Optional[datetime] = None
 
-    model_config = {"from_attributes": True}
+    model_config = ConfigDict(from_attributes=True)
 
     @field_validator(
         "created_at",
@@ -57,7 +68,7 @@ class BatchCreate(BaseModel):
     @classmethod
     def unix_to_datetime(cls, v):
         if isinstance(v, (int, float)):
-            return datetime.fromtimestamp(v)
+            return datetime.fromtimestamp(v, tz=timezone.utc)
         return v
 
 
@@ -79,4 +90,40 @@ class BatchUpdate(BaseModel):
     finalizing_at: Optional[datetime] = None
     in_progress_at: Optional[datetime] = None
 
-    model_config = {"from_attributes": True}
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def ensure_utc(cls, v):
+        if isinstance(v, datetime) and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
+
+class BatchRead(BaseModel):
+    id: int
+    job_id: int
+    batch_id: str
+    status: BatchStatus
+    input_file_id: str
+    local_file_id: str
+    output_file_id: Optional[str] = None
+    request_completed: Optional[int] = None
+    request_failed: Optional[int] = None
+    request_total: Optional[int] = None
+    usage: Optional[Dict[str, Any]] = None
+    errors: Optional[str] = None
+    created_at: datetime
+    calculated_update_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def ensure_utc(cls, v):
+        if isinstance(v, datetime) and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
+    def __repr__(self):
+        return f"<Batch(id={self.id}, batch_id='{self.batch_id}', status='{self.status.value if self.status else None}', local_file='{self.local_file_id}'), created_at={self.created_at}>"

@@ -11,8 +11,12 @@ from openai.types import Batch
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from rich.logging import RichHandler
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
+from rich.table import Table
+from rich.live import Live
+from rich.spinner import Spinner
+from rich.columns import Columns
 from decouple import config
 import polars as pl
 from dataclasses import dataclass
@@ -23,11 +27,13 @@ import tiktoken
 import logging
 import json
 import os
-from typing import Iterable
+from typing import Iterable, Optional
+import asyncio
 
-from .schemas import BatchCreate, BatchUpdate
+from .schemas import JobRead, BatchCreate, BatchUpdate, BatchRead
 from .db.crud import JobRepository, BatchRepository
 from .db.database import get_session
+from .db.models import JobStatus, BatchStatus
 
 logging.basicConfig(
     level=logging.INFO, handlers=[RichHandler(rich_tracebacks=True, markup=True)]
@@ -104,13 +110,6 @@ def map_openai_batch_to_dict(batch_request: Batch) -> dict:
 
 
 class VectorEmbeddings:
-    def __init__(
-        self,
-        model: str,
-        max_input_tokens: int = MAX_INPUT_TOKENS,
-    ):
-        self.model = model
-        self.max_input_tokens = max_input_tokens
 
     def _post_batch_api(self, id: int, file: str) -> None:
         """Uploads the file and request batch embedding job to the API"""
@@ -146,7 +145,11 @@ class VectorEmbeddings:
             return client.batches.retrieve(batch_id)
 
     def _create_batch_file(
-        self, id: int, batch: BatchRequest, max_file_size: int = MAX_BATCH_FILE_SIZE
+        self,
+        id: int,
+        batch: BatchRequest,
+        model: str,
+        max_file_size: int = MAX_BATCH_FILE_SIZE,
     ) -> list[str]:
         """
         Creates multiple JSONL files that represent the batch requests.
@@ -154,7 +157,7 @@ class VectorEmbeddings:
         """
 
         datestr = datetime.now().strftime("%Y%m%d-%H%M")
-        base_name = f"{self.model.split("/")[-1].lower()}-{id}-{datestr}-batch-{batch.batch_id}.jsonl"
+        base_name = f"{model.split("/")[-1].lower()}-{id}-{datestr}-batch-{batch.batch_id}.jsonl"
         base_path = f"./data/embeddings/{id}/batches"
         file = Path(f"{base_path}/{base_name}")
         file.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +170,7 @@ class VectorEmbeddings:
 
         try:
             for req in batch.input:
-                line = req.to_json_line(id, batch.batch_id, self.model, datestr)
+                line = req.to_json_line(id, batch.batch_id, model, datestr)
                 line_size = len(line.encode("utf-8"))
 
                 if current_file_size + line_size > max_file_size:
@@ -224,7 +227,9 @@ class VectorEmbeddings:
                 request_id=req_id, input=current_input, token_count=current_count
             )
 
-    def _batch_texts(self, id: int, texts: list[str]) -> list[str]:
+    def _batch_texts(
+        self, id: int, texts: list[str], model: str, max_input_tokens: int
+    ) -> list[str]:
         """
         Takes a list of texts to embed and split them in multiple batches depending on
         the API limits: Tokens Per Request > Requests Per Batch > Batch File Size
@@ -232,9 +237,9 @@ class VectorEmbeddings:
 
         console.print(
             Panel(
-                f"[bold cyan]Model:[/bold cyan] {self.model}\n"
+                f"[bold cyan]Model:[/bold cyan] {model}\n"
                 f"[bold cyan]Total texts:[/bold cyan] {len(texts):,}\n"
-                f"[bold cyan]Max tokens per request:[/bold cyan] {self.max_input_tokens:,}\n"
+                f"[bold cyan]Max tokens per request:[/bold cyan] {max_input_tokens:,}\n"
                 f"[bold cyan]Max requests per batch:[/bold cyan] {MAX_REQUESTS_PER_BATCH:,}\n",
                 title="[bold]Embedding Configuration[/bold]",
                 border_style="cyan",
@@ -281,7 +286,9 @@ class VectorEmbeddings:
 
         logger.info(f"Created batch request {batch}")
 
-    def _tokenize_texts(self, texts: list[str], max_workers: int = None) -> list[int]:
+    def _tokenize_texts(
+        self, texts: list[str], model: str, max_workers: int = None
+    ) -> list[int]:
         """Tokenize texts in parallel using multiprocessing."""
 
         if max_workers is None:
@@ -296,11 +303,11 @@ class VectorEmbeddings:
         )
 
         try:
-            tiktoken.encoding_for_model(self.model)
-            model_name = self.model
+            tiktoken.encoding_for_model(model)
+            model_name = model
         except:
             logger.warning(
-                f"Could not find a tokenizer in tiktoken for model {self.model}. Defaulting to `cl100k_base` tokenizer. Token count is approximated!"
+                f"Could not find a tokenizer in tiktoken for model {model}. Defaulting to `cl100k_base` tokenizer. Token count is approximated!"
             )
             # NOTE. Can use AutoTokenizer from HF but there's no need for exact matching tokens (only token count). HF very slow to download models.
             # encoding = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -345,17 +352,19 @@ class VectorEmbeddings:
 
         return texts
 
-    def _create_job(self):
+    def _create_job(self, model: str) -> JobRead:
         """Creates a new Job in DB"""
 
         with get_session() as db:
-            job = JobRepository.create_job(db, self.model)
+            job = JobRepository.create_job(db, model)
         return job
 
     def encode_batch(
         self,
         file: str,
         text_column: str | list[str],
+        model: str,
+        max_input_tokens: int = MAX_INPUT_TOKENS,
     ):
         """
         Chunks texts from a Parquet file and submits them for batch embedding.
@@ -384,45 +393,171 @@ class VectorEmbeddings:
         job = self._create_job()
         logger.info(f"New Job {job.id} created for model '{job.model}'")
 
-        batch_files = self._batch_texts(job.id, texts)
+        batch_files = self._batch_texts(job.id, texts, model, max_input_tokens)
 
         for batch_f in batch_files:
             self._post_batch_api(job.id, batch_f)
 
         return job.id
 
-    def check_status(self, job_id: int, refresh: bool = False) -> None:
-        # 1. Get job_id from db
-        # 2. Find all different batch_id from the job
-        # 3. Query openai API
-        # 4. Update jobs and batches in DB
-        # 5. Print message with the batch summary
-        # Repeat from 3. every minute if refresh = True
+    def _check_status_display(
+        self,
+        job: JobRead,
+        batches: list[BatchRead],
+        upd_time: Optional[datetime] = None,
+    ):
+        status_colors = {
+            JobStatus.PENDING: "cyan",
+            JobStatus.PROCESSING: "yellow",
+            JobStatus.COMPLETED: "green",
+            JobStatus.FAILED: "red",
+            BatchStatus.COMPLETED: "green",
+            BatchStatus.VALIDATING: "cyan",
+            BatchStatus.IN_PROGRESS: "yellow",
+            BatchStatus.FAILED: "red",
+            BatchStatus.EXPIRED: "magenta",
+            BatchStatus.CANCELLED: "grey50",
+        }
+
+        job_color = status_colors.get(job.status, "white")
+
+        table = Table(title=f"Batches for Job {job.id}", box=None, show_edge=False)
+        table.add_column("ID", style="cyan")
+        table.add_column("API ID", style="cyan")
+        table.add_column("Status")
+        table.add_column("Completed", style="green")
+        table.add_column("Failed", style="magenta")
+        table.add_column("Total", style="cyan")
+        table.add_column("Errors", style="magenta")
+        table.add_column("Created", style="yellow")
+        table.add_column("Updated", style="yellow")
+
+        for b in batches:
+            b_color = status_colors.get(b.status, "white")
+
+            table.add_row(
+                str(b.id),
+                b.batch_id,
+                f"[{b_color}]{b.status.value}[/]",
+                str(b.request_completed),
+                str(b.request_failed),
+                str(b.request_total),
+                b.errors or "Null",
+                b.created_at.strftime("%d/%m/%Y, %H:%M:%S"),
+                b.calculated_update_at.strftime("%d/%m/%Y, %H:%M:%S"),
+            )
+
+        refresh_info = ""
+        if upd_time is not None:
+            refresh_info = Columns(
+                [
+                    f"[dim]Updating every 1 min. Last update: {upd_time.strftime('%H:%M:%S')}[/] ",
+                    Spinner("point", style="yellow", speed=0.5),
+                ]
+            )
+
+        return Panel(
+            Group(
+                f"Job Status: [bold {job_color}]{job.status.value.upper()}[/]",
+                refresh_info,
+                "",
+                table,
+                "",
+                "[dim italic]Press Enter to exit...[/]",
+            ),
+            title="[bold]Job Monitor[/]",
+            border_style="cyan",
+            expand=False,
+        )
+
+    def _check_status_fetch_and_update(
+        self, job_id: int
+    ) -> tuple[JobRead, list[BatchRead]]:
 
         with get_session() as db:
             batches = BatchRepository.get_batches(db, job_id)
-
             upd_batches = []
             for b in batches:
                 api_batch = self._get_batch_api(b.batch_id)
+                upd_data = BatchUpdate.model_validate(
+                    map_openai_batch_to_dict(api_batch)
+                )
                 upd_batches.append(
                     BatchRepository.update_batch(
-                        db, b.batch_id, BatchUpdate(map_openai_batch_to_dict(api_batch))
+                        db,
+                        b.id,
+                        upd_data,
                     )
                 )
 
             job = JobRepository.update_job_status(db, job_id)
+            return job, upd_batches
 
-            # TODO. Check CRUD operations work well
-            # TODO.Print message with status summary
+    async def _check_status_monitor(self, job_id: int, live: Live) -> None:
+        while True:
+            await asyncio.sleep(60)
+            job, upd_batches = self._check_status_fetch_and_update(job_id)
+            live.update(self._check_status_display(job, upd_batches, datetime.now()))
+
+    async def _check_status_async(self, job: JobRead, batches: list[BatchRead]):
+        with Live(
+            self._check_status_display(job, batches, datetime.now()),
+            refresh_per_second=10,
+        ) as live:
+            monitor_task = asyncio.create_task(self._check_status_monitor(job.id, live))
+            exit_task = asyncio.create_task(asyncio.to_thread(input))
+
+            await asyncio.wait(
+                [monitor_task, exit_task], return_when=asyncio.FIRST_COMPLETED
+            )
+            monitor_task.cancel()
+
+    def check_status(self, job_id: int, refresh: bool = False) -> None:
+        """
+        Displays a Table in the console with relevant info about all the
+        batches linked to a job_id
+        """
+
+        job, batches = self._check_status_fetch_and_update(job_id)
+
+        if not refresh:
+            console.print(self._check_status_display(job, batches))
+            return
+
+        try:
+            asyncio.run(self._check_status_async(job, batches))
+        except KeyboardInterrupt:
+            pass
+
+    # TODO. Test
+    def _download_output_files(self, batches: list[BatchRead]):
+        with OpenAI() as client:
+            for b in batches:
+                fout = b.output_file_id
+                localpath = Path(b.local_file_id)
+                fnew = localpath.parent / f"{localpath.stem}_result" / localpath.suffix
+
+                with open(fnew, "w+", encoding="utf-8") as f:
+                    f.write(fnew)
+
+                client.files.content(fout)
 
     def get_embeddings(self, job_id: int) -> str | None:
         # 1. self.check_status
         # 2. If job.status completed:
         #   2.1 Get output files
         #   2.2 Download files to local
-        #   2.3 Parse files
+        #   2.3 Parse files NOTE Note that the output line order may not match the input line order.
+        #       Instead of relying on order to process your results, use the custom_id field which will
+        #       be present in each line of your output file and allow you to map requests in your input
+        #       to results in your output (https://platform.openai.com/docs/guides/batch#:~:text=Note%20that%20the%20output%20line%20order%20may%20not%20match%20the%20input%20line%20order.%20Instead%20of%20relying%20on%20order%20to%20process%20your%20results%2C%20use%20the%20custom_id%20field%20which%20will%20be%20present%20in%20each%20line%20of%20your%20output%20file%20and%20allow%20you%20to%20map%20requests%20in%20your%20input%20to%20results%20in%20your%20output.)
         #   2.4 Create new file with all the data + embeddings
         #   2.5 Return file
         # 3. else: Print message and return None
-        pass
+
+        job, batches = self._check_status_fetch_and_update(job_id)
+
+        if job.status != JobStatus.COMPLETED:
+            return
+
+        return

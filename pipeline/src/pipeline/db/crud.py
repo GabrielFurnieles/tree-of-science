@@ -1,6 +1,7 @@
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, func
 from sqlalchemy.orm import Session
 from rich.logging import RichHandler
+from datetime import datetime
 import logging
 
 from . import database
@@ -38,16 +39,17 @@ class JobRepository:
         db.commit()
         db.refresh(job)
 
-        db.expunge(job)  # persist job obj after session
-        return job
+        return schemas.JobRead.model_validate(job)
 
     @staticmethod
     def get_job(db: Session, job_id: int):
         stmt = select(models.Job).where(models.Job.id == job_id)
-        return db.execute(stmt)
+        job = db.execute(stmt).scalar_one()
+
+        return schemas.JobRead.model_validate(job)
 
     @staticmethod
-    def update_job_status(db: Session, job_id: int):
+    def update_job_status(db: Session, job_id: int) -> models.Job | None:
         batches = BatchRepository.get_batches(db, job_id)
         statuses = {b.status for b in batches}
 
@@ -66,13 +68,14 @@ class JobRepository:
         elif all([s == models.JobStatus.COMPLETED for s in statuses]):
             new_status = models.JobStatus.COMPLETED
 
-        job = JobRepository.get_job(job_id)
+        job = db.execute(select(models.Job).where(models.Job.id == job_id)).scalar_one()
+
         if new_status is not None and new_status != job.status:
             job.status = new_status
             db.commit()
             db.refresh(job)
 
-        return job
+        return schemas.JobRead.model_validate(job)
 
 
 class BatchRepository:
@@ -84,17 +87,41 @@ class BatchRepository:
         db.commit()
         db.refresh(batch)
 
-        db.expunge(batch)
-        return batch
+        return schemas.BatchRead.model_validate(batch)
 
     @staticmethod
     def get_batches(db: Session, job_id: int):
         stmt = select(models.Batch).where(models.Batch.job_id == job_id)
-        return db.scalars(stmt).all()
+        batches = db.execute(stmt).scalars().all()
+        return [schemas.BatchRead.model_validate(b) for b in batches]
 
     @staticmethod
-    def update_batch(db: Session, batch_id: int, update_data: schemas.BatchUpdate):
-        batch = db.execute(select(models.Batch).where(models.Batch.id == batch_id))
+    def update_batch(db: Session, id: int, update_data: schemas.BatchUpdate):
+        timestamp_cols = [
+            models.Batch.created_at,
+            models.Batch.cancelled_at,
+            models.Batch.cancelling_at,
+            models.Batch.completed_at,
+            models.Batch.expired_at,
+            models.Batch.failed_at,
+            models.Batch.finalizing_at,
+            models.Batch.in_progress_at,
+        ]
+
+        calculated_update_at = func.max(
+            *[func.coalesce(col, datetime.min) for col in timestamp_cols]
+        )
+
+        result = db.execute(
+            select(
+                models.Batch,
+                calculated_update_at.label("calculated_update_at"),
+            ).where(models.Batch.id == id)
+        ).one()
+
+        batch, calc_date = result
+
+        # Update batch with new data
         update_dict = update_data.model_dump(exclude_unset=True)
 
         for k, v in update_dict.items():
@@ -102,4 +129,8 @@ class BatchRepository:
 
         db.commit()
         db.refresh(batch)
-        return batch
+
+        # Add calculated field for display
+        batch.calculated_update_at = calc_date
+
+        return schemas.BatchRead.model_validate(batch)

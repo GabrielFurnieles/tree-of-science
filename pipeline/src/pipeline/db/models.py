@@ -1,9 +1,9 @@
 from sqlalchemy import (
     Integer,
     String,
-    DateTime,
     Text,
     JSON,
+    DateTime,
     ForeignKey,
     Enum,
 )
@@ -62,11 +62,17 @@ class Job(Base):
         index=True,
     )
     model: Mapped[str]
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now("now", "utc")
     )
-    finished_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now("now", "utc"),
+        onupdate=func.now("now", "utc"),
+    )
+    finished_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     batches: Mapped[List["Batch"]] = relationship(
         "Batch", back_populates="job", cascade="all, delete-orphan"
