@@ -31,13 +31,14 @@ class BatchStatus(str, enum.Enum):
     Batch status values from OpenAI Batch API.
 
     Lifecycle:
-    validating → in_progress → finalizing → completed
-                                          ↘ failed
-                                          ↘ expired
-                                          ↘ cancelled
+    validating → validated -> in_progress → finalizing → completed
+                                                       ↘ failed
+                                                       ↘ expired
+                                                       ↘ cancelled
     """
 
     VALIDATING = "validating"
+    VALIDATED = "validated"
     IN_PROGRESS = "in_progress"
     FINALIZING = "finalizing"
     COMPLETED = "completed"
@@ -48,7 +49,7 @@ class BatchStatus(str, enum.Enum):
 
 
 class Job(Base):
-    __tablename__ = "dim_embedding_jobs"
+    __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, index=True, autoincrement=True
@@ -83,7 +84,7 @@ class Job(Base):
 
 
 class Batch(Base):
-    __tablename__ = "dim_embedding_batches"
+    __tablename__ = "batches"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[int] = mapped_column(
@@ -91,7 +92,7 @@ class Batch(Base):
     )
 
     # OpenAI Batch API fields (matching JSONL structure)
-    batch_id: Mapped[str] = mapped_column(String, index=True)  # OpenAI batch ID
+    batch_oaid: Mapped[str] = mapped_column(String, index=True)  # OpenAI batch ID
     completion_window: Mapped[str]
     endpoint: Mapped[str]
     object: Mapped[str]

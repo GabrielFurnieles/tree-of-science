@@ -21,7 +21,7 @@ class BatchCreate(BaseModel):
     job_id: int
 
     # OpenAI Batch API fields
-    batch_id: str
+    batch_oaid: str
     completion_window: str
     endpoint: str
     object: str
@@ -103,7 +103,7 @@ class BatchUpdate(BaseModel):
 class BatchRead(BaseModel):
     id: int
     job_id: int
-    batch_id: str
+    batch_oaid: str
     status: BatchStatus
     input_file_id: str
     local_file_id: str
@@ -126,4 +126,4 @@ class BatchRead(BaseModel):
         return v
 
     def __repr__(self):
-        return f"<Batch(id={self.id}, batch_id='{self.batch_id}', status='{self.status.value if self.status else None}', local_file='{self.local_file_id}'), created_at={self.created_at}>"
+        return f"<Batch(id={self.id}, batch_oaid='{self.batch_oaid}', status='{self.status.value if self.status else None}', local_file='{self.local_file_id}'), created_at={self.created_at}>"
