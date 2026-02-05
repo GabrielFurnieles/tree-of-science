@@ -12,10 +12,12 @@ import logging
 import asyncio
 import json
 import os
+import re
 
 from openai.types import Batch
 from openai import OpenAI
 
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.console import Console, Group
 from rich.logging import RichHandler
 from rich.spinner import Spinner
@@ -32,6 +34,8 @@ from .db.database import get_session
 logging.basicConfig(
     level=logging.INFO, handlers=[RichHandler(rich_tracebacks=True, markup=True)]
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 console = Console()
@@ -56,7 +60,7 @@ class EmbeddingRequest:
     def to_json_line(self, job_id: int, batch_id: str) -> str:
         """Serializes request into JSONL format required by the API"""
         payload = {
-            "custom_id": f"batch-{job_id}-{batch_id}-request-{self.id}",
+            "custom_id": f"batch-{str(job_id).zfill(4)}-{str(batch_id).zfill(5)}-request-{str(self.id).zfill(6)}",
             "method": "POST",
             "url": "/v1/embeddings",
             "body": {"model": self.model, "input": self.input},
@@ -182,6 +186,10 @@ class VectorEmbeddings:
         if job.status != JobStatus.COMPLETED:
             return
 
+        out_files = self._download_output_files(batches)
+
+        self._parse_output_files(out_files)
+
         return
 
     def _post_batch_api(self, id: int, file: str) -> None:
@@ -223,8 +231,8 @@ class VectorEmbeddings:
         Each file has a maximum size allowed according to the API (OpenAI 200MB)
         """
 
-        base_name = f"{model.split("/")[-1].lower()}-{id}-batch-{batch.id}.jsonl"
-        base_path = f"./data/embeddings/{id}/batches"
+        base_name = f"{model.split("/")[-1].lower()}-{str(id).zfill(4)}-batch-{str(batch.id).zfill(4)}.jsonl"
+        base_path = f"./data/embeddings/{str(id).zfill(4)}/batches"
         file = Path(f"{base_path}/{base_name}")
         file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -505,6 +513,7 @@ class VectorEmbeddings:
     def _check_status_fetch_and_update(
         self, job_id: int
     ) -> tuple[JobRead, list[BatchRead]]:
+        logger.info(f"Updating Batch statuses for [yellow]Job {job_id}[/]")
 
         with get_session() as db:
             batches = BatchRepository.get_batches(db, job_id)
@@ -544,15 +553,72 @@ class VectorEmbeddings:
             )
             monitor_task.cancel()
 
-    # TODO. Test
-    def _download_output_files(self, batches: list[BatchRead]):
-        with OpenAI() as client:
-            for b in batches:
-                fout = b.output_file_id
-                localpath = Path(b.local_file_id)
-                fnew = localpath.parent / f"{localpath.stem}_result" / localpath.suffix
+    def _download_output_files(self, batches: list[BatchRead]) -> list[Path]:
+        progress = Progress(
+            TextColumn("🛻💨"),
+            SpinnerColumn("point"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        )
 
-                with open(fnew, "w+", encoding="utf-8") as f:
-                    f.write(fnew)
+        logger.info("Downloading Output files!")
 
-                client.files.content(fout)
+        with progress:
+            task = progress.add_task("download", total=len(batches))
+
+            with OpenAI(
+                base_url=config("OAI_URL"), api_key=config("OAI_API_KEY")
+            ) as client:
+
+                out_files = []
+
+                for b in batches:
+                    fout = b.output_file_id
+                    localpath = Path(b.local_file_id)
+
+                    fnew = localpath.parent / f"{localpath.stem}_result.jsonl"
+                    fnew.parent.mkdir(parents=True, exist_ok=True)
+
+                    content = client.files.content(fout)
+                    fnew.write_text(content.text, encoding="utf-8")
+
+                    out_files.append(fnew)
+                    progress.advance(task)  # Update progress bar
+
+        return out_files
+
+    def _parse_output_files(self, files: list[Path]):
+        for f in files:
+            map_sorted = self._sort_output_file(f)
+            self._stream_file_to_sorted_numpy(f, map_sorted)
+
+    def _sort_output_file(self, file: Path) -> list[tuple[str, int]]:
+        id_pattern = re.compile(rb'"custom_id"\s*:\s*"([^"]+)"')
+        line_map = []  # Contains the custom_id and start line position
+
+        with file.open("rb") as f:
+            while True:
+                offset = f.tell()
+                chunk = f.read(1024)  # read only start of line
+
+                if not chunk:
+                    break
+
+                match = id_pattern.search(chunk)
+                if match:
+                    line_map.append((match.group(1).decode("utf-8"), offset))
+
+                f.seek(offset)
+                f.readline()
+
+        line_map.sort(key=lambda x: x[0])
+
+        input(line_map)
+
+        return line_map
+
+    def _stream_file_to_sorted_numpy(self, f: Path, map_sorted: list[tuple[str, int]]):
+        pass
+
+
+Embeddings = VectorEmbeddings()

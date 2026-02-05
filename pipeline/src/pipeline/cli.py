@@ -2,7 +2,7 @@ import typer
 from rich import print
 from decouple import config
 from .etl import KaggleDatasetExtractor, ArxivDatasetTransformer
-from .embeddings import VectorEmbeddings
+from .embeddings import Embeddings
 from .db.crud import DBRepository
 from .db.database import engine
 
@@ -51,14 +51,13 @@ def clean_dataset():
 # TEST
 @app.command()
 def create_embeddings(model: str = "Qwen/Qwen3-Embedding-8B"):
-    embeddings = VectorEmbeddings()
-    job_id = embeddings.encode_batch(
+    job_id = Embeddings.encode_batch(
         file="./data/interim/clean-arxiv-metadata-oai.parquet",
         text_column=["title", "abstract"],
         model=model,
     )
 
-    embeddings.check_status(job_id)
+    Embeddings.check_status(job_id)
 
     print(
         f"\n[bold]✨ Batch embeddings posted.[/bold] You can check the requests info at get-job-status --id {job_id}"
@@ -68,8 +67,14 @@ def create_embeddings(model: str = "Qwen/Qwen3-Embedding-8B"):
 # TEST
 @app.command()
 def check_status(job_id: int):
-    embeddings = VectorEmbeddings()
-    embeddings.check_status(job_id, refresh=True)
+    Embeddings.check_status(job_id, refresh=True)
+
+
+@app.command()
+def get_embeddings(job_id: int):
+    Embeddings.get_embeddings(job_id)
+
+    print(f"\n[bold]✨ Embeddings downloaded!")
 
 
 if __name__ == "__main__":
