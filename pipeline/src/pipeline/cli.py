@@ -58,7 +58,6 @@ def create_embeddings(model: str = "Qwen/Qwen3-Embedding-8B"):
     )
 
     Embeddings.check_status(job_id)
-
     print(
         f"\n[bold]✨ Batch embeddings posted.[/bold] You can check the requests info at get-job-status --id {job_id}"
     )
@@ -72,9 +71,8 @@ def check_status(job_id: int):
 
 @app.command()
 def get_embeddings(job_id: int):
-    Embeddings.get_embeddings(job_id)
-
-    print(f"\n[bold]✨ Embeddings downloaded!")
+    embs_file = Embeddings.get_embeddings(job_id)
+    print(f"\n[bold]✨ Embeddings for job {job_id} downloaded at {embs_file}!")
 
 
 if __name__ == "__main__":

@@ -7,17 +7,27 @@ from decouple import config
 from pathlib import Path
 from tqdm import tqdm
 import polars as pl
+import numpy as np
 import tiktoken
 import logging
 import asyncio
+import ijson
 import json
+import mmap
 import os
 import re
 
 from openai.types import Batch
 from openai import OpenAI
 
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeRemainingColumn,
+)
 from rich.console import Console, Group
 from rich.logging import RichHandler
 from rich.spinner import Spinner
@@ -48,6 +58,7 @@ MAX_TOKENS_PER_MINUTE = 1_000_000  # According to OpenAI docs Tier 1 = 1_000_000
 MAX_BATCH_FILE_SIZE = (
     200 * 1024 * 1024
 )  # 10GB According to Nebius batch inference API docs (converted to bytes)
+EMBEDDING_DIM = 4_096
 
 
 @dataclass
@@ -155,6 +166,11 @@ class VectorEmbeddings:
         """
         Displays a Table in the console with relevant info about all the
         batches linked to a job_id
+
+        Args:
+            job_id: Id of the checking status Job
+            refresh: Wether to keep refreshing the table and displaying it
+                in the console every minute
         """
 
         job, batches = self._check_status_fetch_and_update(job_id)
@@ -169,17 +185,16 @@ class VectorEmbeddings:
             pass
 
     def get_embeddings(self, job_id: int) -> str | None:
-        # 1. self.check_status
-        # 2. If job.status completed:
-        #   2.1 Get output files
-        #   2.2 Download files to local
-        #   2.3 Parse files NOTE Note that the output line order may not match the input line order.
-        #       Instead of relying on order to process your results, use the custom_id field which will
-        #       be present in each line of your output file and allow you to map requests in your input
-        #       to results in your output (https://platform.openai.com/docs/guides/batch#:~:text=Note%20that%20the%20output%20line%20order%20may%20not%20match%20the%20input%20line%20order.%20Instead%20of%20relying%20on%20order%20to%20process%20your%20results%2C%20use%20the%20custom_id%20field%20which%20will%20be%20present%20in%20each%20line%20of%20your%20output%20file%20and%20allow%20you%20to%20map%20requests%20in%20your%20input%20to%20results%20in%20your%20output.)
-        #   2.4 Create new file with all the data + embeddings
-        #   2.5 Return file
-        # 3. else: Print message and return None
+        """
+        Download and parse the embeddings for a specific Job (only if all
+        the batch requests have been completed)
+
+        Args:
+            job_id: Id of the Job
+
+        Returns:
+            The Path to the final file cotaining all the embeddings
+        """
 
         job, batches = self._check_status_fetch_and_update(job_id)
 
@@ -188,9 +203,9 @@ class VectorEmbeddings:
 
         out_files = self._download_output_files(batches)
 
-        self._parse_output_files(out_files)
+        embs_file = self._parse_output_files(out_files)
 
-        return
+        return embs_file
 
     def _post_batch_api(self, id: int, file: str) -> None:
         """Uploads the file and request batch embedding job to the API"""
@@ -587,19 +602,56 @@ class VectorEmbeddings:
 
         return out_files
 
-    def _parse_output_files(self, files: list[Path]):
+    def _parse_output_files(self, files: list[Path]) -> Path:
+        """
+        Parses the OAI Batch API response files containing the mebddings
+        into a single npy file.
+
+        NOTE. This method doesn't know about the total number of vector embeddings
+        requested accross all batches,having to stream the embeddings first into
+        a .raw file and later copying them into a .npy file where the shape is
+        pre-fixed.
+        """
+
+        out_raw = files[0].parents[1] / f'{"-".join(files[0].stem.split("-")[:-2])}.raw'
+        out_npy = out_raw.with_suffix(".npy")
+
+        vec_count = 0
         for f in files:
             map_sorted = self._sort_output_file(f)
-            self._stream_file_to_sorted_numpy(f, map_sorted)
+            vec_count += self._stream_embs_to_sorted_raw(f, map_sorted, out_raw)
+
+        out_file = self._stream_raw_to_numpy(
+            fraw=out_raw, dims=(vec_count, EMBEDDING_DIM), fout=out_npy
+        )
+
+        os.remove(out_raw)  # delete raw file
+        return out_file
 
     def _sort_output_file(self, file: Path) -> list[tuple[str, int]]:
+        """
+        Takes an Embedding OAI Batch API response file and sorts its responses
+        based on the "custom_id" field as instructed by the API docs (https://platform.openai.com/docs/guides/batch#:~:text=Note%20that%20the%20output%20line%20order%20may%20not%20match%20the%20input%20line%20order.%20Instead%20of%20relying%20on%20order%20to%20process%20your%20results%2C%20use%20the%20custom_id%20field%20which%20will%20be%20present%20in%20each%20line%20of%20your%20output%20file%20and%20allow%20you%20to%20map%20requests%20in%20your%20input%20to%20results%20in%20your%20output.)
+
+        Args:
+            file: Path to the Batch API response file
+
+        Returns:
+            A list of tuples (custom_id, offset) organised by "custom_id". The offset
+            represents the line position where the response with that ccustom_id starts.
+
+        NOTE. Instead of explicitly sorting the file this function returns a sorted
+        map object that maps the custom_id with the corresponding line in the file,
+        avoiding extra computations.
+        """
+
         id_pattern = re.compile(rb'"custom_id"\s*:\s*"([^"]+)"')
         line_map = []  # Contains the custom_id and start line position
 
         with file.open("rb") as f:
             while True:
                 offset = f.tell()
-                chunk = f.read(1024)  # read only start of line
+                chunk = f.read(500)  # read only start of line
 
                 if not chunk:
                     break
@@ -612,13 +664,110 @@ class VectorEmbeddings:
                 f.readline()
 
         line_map.sort(key=lambda x: x[0])
-
-        input(line_map)
-
         return line_map
 
-    def _stream_file_to_sorted_numpy(self, f: Path, map_sorted: list[tuple[str, int]]):
-        pass
+    def _stream_embs_to_sorted_raw(
+        self, file: Path, map_sorted: list[tuple[str, int]], output_raw: Path
+    ) -> int:
+        """
+        Streams embeddings from the OAI Batch response file to a .raw file in the
+        order they were requested.
+
+        Args:
+            file: Input Path OAI Batch response file
+            map_sorted: Ordered list of tuples containing (custom_id, offset) where
+                custom_id is the sorting key and offset the position of the line where
+                the response for that custom_id start in the Batch response file.
+            output_raw: Output Path to the .raw file (shared accross multiple files)
+
+        Returns:
+            The total count of vectors from the processed file
+        """
+
+        VECTOR_BATCH_SIZE = 1000
+        vec_count = 0
+        vec_batch = []
+
+        # Define the rich progress bar columns
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+        )
+
+        with progress:
+            task_id = progress.add_task(f"Streaming {file.name}", total=len(map_sorted))
+
+            with open(file, "rb") as f_in:
+                # Use mmap to random access file faster
+                with mmap.mmap(f_in.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    with open(output_raw, "ab+") as f_out:
+                        for _, offset in map_sorted:
+                            mm.seek(offset)
+                            line = mm.readline()
+
+                            progress.update(task_id, advance=1)
+
+                            if not line:
+                                continue
+
+                            try:
+                                data = json.loads(line)
+                                items = data["response"]["data"]
+
+                                for i in items:
+                                    vec_batch.append(i["embedding"])
+
+                                    if len(vec_batch) >= VECTOR_BATCH_SIZE:
+                                        arr = np.array(vec_batch, dtype="float32")
+                                        f_out.write(arr.tobytes())
+                                        vec_count += len(vec_batch)
+                                        vec_batch = []
+
+                            except Exception as e:
+                                # Use rich's print to avoid breaking the progress bar layout
+                                progress.console.print(
+                                    f"[red]Error parsing line from {file.name} at offset: {offset} -> {e}[/red]"
+                                )
+
+                        # Final flush
+                        if vec_batch:
+                            arr = np.array(vec_batch, dtype="float32")
+                            f_out.write(arr.tobytes())
+                            vec_count += len(vec_batch)
+
+        return vec_count
+
+    def _stream_raw_to_numpy(self, fraw: Path, dims: tuple[int], fout: Path) -> Path:
+        """
+        Takes a .raw file containing the vector embeddings and streams
+        it into a .npy file with pre-fixed shape. This way embeddings
+        are stored in a more propper and efficient format, as .npy  files
+        contain metadata about the shape and data type.
+        """
+
+        npy = np.lib.format.open_memmap(fout, mode="w+", dtype="float32", shape=dims)
+
+        # Stream raw file in chunks of 100MB
+        chunk_size = 100 * 1024 * 1024
+        rows_per_chunk = chunk_size // (dims[1] * 4)  # float32 = 4 bytes
+
+        with open(fraw, "rb") as f:
+            for start_row in range(0, dims[0], rows_per_chunk):
+                end_row = min(start_row + rows_per_chunk, dims[0])
+                bytes_to_read = (end_row - start_row) * dims[1] * 4
+                raw_chunk = f.read(bytes_to_read)
+                array_chunk = np.frombuffer(raw_chunk, dtype="float32").reshape(
+                    end_row - start_row, dims[1]
+                )
+                npy[start_row:end_row] = array_chunk
+
+        npy.flush()
+        del npy  # delete reference (mmap objects can sometimes keep a file "busy" even after the function ends)
+
+        return fout
 
 
 Embeddings = VectorEmbeddings()
