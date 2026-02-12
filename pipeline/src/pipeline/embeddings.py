@@ -47,10 +47,10 @@ class EmbeddingConfig:
     model: str
     embedding_dim: int = field(init=False)
     max_input_tokens: int = (
-        1_000  # 200_000  # Max input tokens across all inputs in a single request. According to OpenAI docs is 300_000 but OpenAI counts different than tiktoken
+        200_000  # Max input tokens across all inputs in a single request. According to OpenAI docs is 300_000 but OpenAI counts different than tiktoken
     )
     max_requests_per_batch: int = (
-        100  # 50_000  # According to OpenAI batch inference API docs
+        50_000  # According to OpenAI batch inference API docs
     )
     max_batch_file_size: int = 200 * 1024 * 1024  # 200MB
     output_path: str = "./data/embeddings"

@@ -132,7 +132,7 @@ class BatchManager:
             f"Reading data from {file} 🔎\nThis may take a few seconds depending on the file size..."
         )
 
-        df = pl.read_parquet(file).head(2_000)  # TODO. Remove .head() in prod
+        df = pl.read_parquet(file)
 
         if isinstance(text_column, list):
             texts = (

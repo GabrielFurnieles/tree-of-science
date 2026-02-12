@@ -13,34 +13,24 @@ app = typer.Typer()
 DBRepository.create_db(engine)
 
 
-# Commands
-@app.command()
-def hello_pipeline():
-    print("Hello pipeline!")
-
-
-@app.command()
-def bye_pipeline():
-    print("Bye pipeline!")
-
-
 @app.command()
 def recreate_db():
+    """🔮 Recreates the entire Database."""
+
     DBRepository.recreate_db(engine)
     print("🔮 Database recreated!")
 
 
-# TEST
 @app.command()
-def extract_dataset():
+def get_dataset():
+    """📄 Download and clean the latest version of the ArXiv Kaggle Dataset."""
+
+    # Extract
     extractor = KaggleDatasetExtractor(config("KAGGLE_USERNAME"), config("KAGGLE_KEY"))
     path = extractor.get_dataset(dataset="Cornell-University/arxiv", path="./data")
     print(f"Files downloaded at: /{path}")
 
-
-# TEST
-@app.command()
-def clean_dataset():
+    # Transform
     transformer = ArxivDatasetTransformer(
         jsonfile="./data/arxiv-metadata-oai-snapshot.json"
     )
@@ -48,9 +38,10 @@ def clean_dataset():
     print(f"Files created at: /{clean_path}")
 
 
-# TEST
 @app.command()
-def create_embeddings(model: str = "Qwen/Qwen3-Embedding-8B"):
+def compute_embeddings(model: str = "Qwen/Qwen3-Embedding-8B"):
+    """⚒️  Create and Embedding Job and Submit a request to the Batch Embedding API form the cleaned dataset file."""
+
     Embeddings = VectorEmbeddings(model)
     job_id = Embeddings.encode_batch(
         file="./data/interim/clean-arxiv-metadata-oai.parquet",
@@ -59,19 +50,21 @@ def create_embeddings(model: str = "Qwen/Qwen3-Embedding-8B"):
 
     Embeddings.check_status(job_id)
     print(
-        f"\n[bold]✨ Batch embeddings posted.[/bold] You can check the requests info at get-job-status --id {job_id}"
+        f"\n[bold]✨ Batch embeddings posted.[/bold] You can check the requests info at [bold yellow]check-embeddings-status --id {job_id}[/]"
     )
 
 
-# TEST
 @app.command()
-def check_status(job_id: int):
+def check_embeddings_status(job_id: int):
+    """🔎 Check the status for an Embedding Job. Info is updated every 1 minute."""
+
     Embeddings = VectorEmbeddings()
     Embeddings.check_status(job_id, refresh=True)
 
 
 @app.command()
 def get_embeddings(job_id: int):
+    """✨ Download the embeddings for a given Job. Only if the job has status completed."""
     Embeddings = VectorEmbeddings()
     embs_file = Embeddings.get_embeddings(job_id)
     print(f"\n[bold]✨ Embeddings for job {job_id} downloaded at {embs_file}!")
