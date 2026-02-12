@@ -614,5 +614,7 @@ class BatchMonitor:
     async def _check_status_monitor(self, job_id: int, live: Live) -> None:
         while True:
             await asyncio.sleep(60)
-            job, upd_batches = self.check_status_fetch_and_update(job_id)
+            job, upd_batches = await asyncio.to_thread(
+                self.check_status_fetch_and_update
+            )
             live.update(self.check_status_display(job, upd_batches, datetime.now()))
