@@ -11,7 +11,7 @@ from .. import schemas
 logging.basicConfig(
     level=logging.INFO, handlers=[RichHandler(rich_tracebacks=True, markup=True)]
 )
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 
 class DBRepository:

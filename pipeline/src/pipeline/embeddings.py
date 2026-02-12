@@ -1,17 +1,9 @@
-from concurrent.futures import ProcessPoolExecutor
-from typing import Iterable, Optional
-from dataclasses import dataclass
-from functools import partial
-from datetime import datetime
+from dataclasses import dataclass, field
 from decouple import config
 from pathlib import Path
-from tqdm import tqdm
-import polars as pl
 import numpy as np
-import tiktoken
 import logging
 import asyncio
-import ijson
 import json
 import mmap
 import os
@@ -28,17 +20,14 @@ from rich.progress import (
     TaskProgressColumn,
     TimeRemainingColumn,
 )
-from rich.console import Console, Group
+from rich.console import Console
 from rich.logging import RichHandler
-from rich.spinner import Spinner
-from rich.columns import Columns
-from rich.panel import Panel
-from rich.table import Table
-from rich.live import Live
 
-from .schemas import JobRead, BatchCreate, BatchUpdate, BatchRead
-from .db.crud import JobRepository, BatchRepository
-from .db.models import JobStatus, BatchStatus
+
+from .utils import BatchManager, BatchMonitor
+from .schemas import JobRead, BatchRead
+from .db.crud import JobRepository
+from .db.models import JobStatus
 from .db.database import get_session
 
 logging.basicConfig(
@@ -50,84 +39,45 @@ logger = logging.getLogger(__name__)
 
 console = Console()
 
-
-MAX_INPUT_TOKENS = 1_000  # 200_000  # Max input tokens across all inputs in a single request. According to OpenAI docs is 300_000 but OpenAI counts different than tiktoken
-MAX_REQUESTS_PER_BATCH = 100  # 50_000  # According to OpenAI batch inference API docs
-MAX_REQUESTS_PER_MINUTE = 3_000  # According to OpenAI docs Tier 1 = 3_000 RPM
-MAX_TOKENS_PER_MINUTE = 1_000_000  # According to OpenAI docs Tier 1 = 1_000_000 TPM
-MAX_BATCH_FILE_SIZE = (
-    200 * 1024 * 1024
-)  # 10GB According to Nebius batch inference API docs (converted to bytes)
-EMBEDDING_DIM = 4_096
+MODEL_SPEC = {"Qwen/Qwen3-Embedding-8B": 4096}
 
 
 @dataclass
-class EmbeddingRequest:
-    id: int
-    input: str | list[str]
+class EmbeddingConfig:
     model: str
-    token_count: int
+    embedding_dim: int = field(init=False)
+    max_input_tokens: int = (
+        1_000  # 200_000  # Max input tokens across all inputs in a single request. According to OpenAI docs is 300_000 but OpenAI counts different than tiktoken
+    )
+    max_requests_per_batch: int = (
+        100  # 50_000  # According to OpenAI batch inference API docs
+    )
+    max_batch_file_size: int = 200 * 1024 * 1024  # 200MB
+    output_path: str = "./data/embeddings"
 
-    def to_json_line(self, job_id: int, batch_id: str) -> str:
-        """Serializes request into JSONL format required by the API"""
-        payload = {
-            "custom_id": f"batch-{str(job_id).zfill(4)}-{str(batch_id).zfill(5)}-request-{str(self.id).zfill(6)}",
-            "method": "POST",
-            "url": "/v1/embeddings",
-            "body": {"model": self.model, "input": self.input},
-        }
-        return json.dumps(payload, ensure_ascii=False) + "\n"
-
-
-@dataclass
-class BatchRequest:
-    id: int
-    input: list[EmbeddingRequest]
-    text_count: int
-    token_count: int
-
-
-# Utility functions
-def tokenize(texts_chunk: list, model_name: str) -> list[int]:
-    """Worker function to tokenize a chunk of texts."""
-    try:
-        encoding = tiktoken.encoding_for_model(model_name)
-    except KeyError:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    return [len(encoding.encode(t, allowed_special="all")) for t in texts_chunk]
-
-
-def chunk_list(lst: list, chunk_size: int) -> Iterable[list[str]]:
-    """Split list into chunks of specified size."""
-    for i in range(0, len(lst), chunk_size):
-        yield lst[i : i + chunk_size]
-
-
-def map_openai_batch_to_dict(batch_request: Batch) -> dict:
-    """Maps an OpenAI Batch object to a flattened Python dictionary for DB schemas."""
-
-    payload = batch_request.model_dump(exclude={"id", "request_counts"})
-    payload["batch_oaid"] = batch_request.id
-
-    if batch_request.request_counts:
-        counts_dict = {
-            f"request_{k}": v
-            for k, v in batch_request.request_counts.model_dump().items()
-        }
-        payload.update(counts_dict)
-
-    return payload
+    def __post_init__(self):
+        if self.model in MODEL_SPEC:
+            self.embedding_dim = MODEL_SPEC[self.model]
+        else:
+            raise ValueError(f"Unknown model {self.model}. Check the supported models.")
 
 
 class VectorEmbeddings:
+    def __init__(self, model: str = None, **overrides):
 
-    def encode_batch(
-        self,
-        file: str,
-        text_column: str | list[str],
-        model: str,
-        max_input_tokens: int = MAX_INPUT_TOKENS,
-    ):
+        self.config = None
+        self.manager = None
+        self.overrides = overrides
+
+        if model is not None:
+            self._set_up_manager(model)
+
+        self.client = OpenAI(
+            base_url=config("OAI_URL"),
+            api_key=config("OAI_API_KEY"),
+        )
+
+    def encode_batch(self, file: str, text_column: str | list[str]):
         """
         Chunks texts from a Parquet file and submits them for batch embedding.
 
@@ -139,23 +89,9 @@ class VectorEmbeddings:
         Returns:
             A list of paths to the generated batch request files.
         """
-
-        f = Path(file)
-
-        assert (
-            f.suffix == ".parquet"
-        ), f"Expected 'file' to be a .parquet file, instead got {file}"
-        assert f.exists(), f"Couldn't find the parquet file {file}"
-
-        texts = self._parse_texts(file, text_column)
-        logger.info(
-            f"Found {len(texts)} texts! Creating new job to compute embeddings..."
-        )
-
-        job = self._create_job(model)
-        logger.info(f"New Job {job.id} created for model '{job.model}'")
-
-        batch_files = self._batch_texts(job.id, texts, model, max_input_tokens)
+        texts = self.manager.parse_texts(file, text_column)
+        job = self._create_job(self.config.model)
+        batch_files = self.manager.batch_texts(job.id, texts)
 
         for batch_f in batch_files:
             self._post_batch_api(job.id, batch_f)
@@ -172,15 +108,20 @@ class VectorEmbeddings:
             refresh: Wether to keep refreshing the table and displaying it
                 in the console every minute
         """
+        monitor = BatchMonitor(job_id, fetch_callback=self._get_batch_api)
 
-        job, batches = self._check_status_fetch_and_update(job_id)
+        job, batches = monitor.check_status_fetch_and_update()
+
+        if job is None:
+            logger.warning("Skipping Job monitoring")
+            return
 
         if not refresh:
-            console.print(self._check_status_display(job, batches))
+            console.print(monitor.check_status_display(job, batches))
             return
 
         try:
-            asyncio.run(self._check_status_async(job, batches))
+            asyncio.run(monitor.check_status_async(job, batches))
         except KeyboardInterrupt:
             pass
 
@@ -195,378 +136,56 @@ class VectorEmbeddings:
         Returns:
             The Path to the final file cotaining all the embeddings
         """
-
-        job, batches = self._check_status_fetch_and_update(job_id)
+        monitor = BatchMonitor(job_id, fetch_callback=self._get_batch_api)
+        job, batches = monitor.check_status_fetch_and_update()
 
         if job.status != JobStatus.COMPLETED:
             return
 
+        model = self._fetch_model(job_id)
+        if model is not None:
+            self._set_up_manager(model)
+        else:
+            return
+
         out_files = self._download_output_files(batches)
 
-        embs_file = self._parse_output_files(out_files)
+        embs_file = self.manager.parse_output_files(out_files)
 
         return embs_file
 
+    def _set_up_manager(self, model: str):
+        self.config = EmbeddingConfig(model=model, **self.overrides)
+        self.manager = BatchManager(self.config)
+
     def _post_batch_api(self, id: int, file: str) -> None:
         """Uploads the file and request batch embedding job to the API"""
+        file_upload = self.client.files.create(file=open(file, "rb"), purpose="batch")
 
-        with OpenAI(
-            base_url=config("OAI_URL"),
-            api_key=config("OAI_API_KEY"),
-        ) as client:
+        batch_request = self.client.batches.create(
+            input_file_id=file_upload.id,
+            endpoint="/v1/embeddings",
+            completion_window="24h",
+        )
 
-            file_upload = client.files.create(file=open(file, "rb"), purpose="batch")
-
-            batch_request = client.batches.create(
-                input_file_id=file_upload.id,
-                endpoint="/v1/embeddings",
-                completion_window="24h",
-            )
-
-            self._log_batch_request(id, batch_request, file)
+        self.manager.log_batch_request(id, batch_request, file)
 
     def _get_batch_api(self, batch_oaid: str) -> Batch:
-
-        with OpenAI(
-            base_url=config("OAI_URL"),
-            api_key=config("OAI_API_KEY"),
-        ) as client:
-
-            return client.batches.retrieve(batch_oaid)
-
-    def _create_batch_file(
-        self,
-        id: int,
-        batch: BatchRequest,
-        model: str,
-        max_file_size: int = MAX_BATCH_FILE_SIZE,
-    ) -> list[str]:
-        """
-        Creates multiple JSONL files that represent the batch requests.
-        Each file has a maximum size allowed according to the API (OpenAI 200MB)
-        """
-
-        base_name = f"{model.split("/")[-1].lower()}-{str(id).zfill(4)}-batch-{str(batch.id).zfill(4)}.jsonl"
-        base_path = f"./data/embeddings/{str(id).zfill(4)}/batches"
-        file = Path(f"{base_path}/{base_name}")
-        file.parent.mkdir(parents=True, exist_ok=True)
-
-        files = []
-        current_file_size = 0
-        split_num = 1
-
-        f = open(file, "w+", encoding="utf-8")
-
-        try:
-            for req in batch.input:
-                line = req.to_json_line(id, batch.id)
-                line_size = len(line.encode("utf-8"))
-
-                if current_file_size + line_size > max_file_size:
-                    f.close()
-                    files.append(f.name)
-                    logger.info(
-                        f"[yellow]✨ Created file {f.name} for Batch #{batch.id}.[/]"
-                    )
-
-                    file_split = file.parent / f"{file.stem}_{split_num}.jsonl"
-                    f = open(file_split)
-                    current_file_size = 0
-                    split_num += 1
-
-                f.write(line)
-                current_file_size += line_size
-
-        finally:
-            if f:
-                f.close()
-                files.append(f.name)
-                logger.info(
-                    f"[yellow]✨ Created file {f.name} for Batch #{batch.id}.[/]"
-                )
-
-        return files
-
-    def _generate_embedding_request(
-        self, texts: list[str], model: str, counts: list[int], max_input_tokens: int
-    ) -> Iterable[EmbeddingRequest]:
-        """
-        Generator function that create EmbeddingRequest objects according to the
-        maximum limit of tokens allowed per request (TPR)
-        """
-
-        logger.info("Batching requests...")
-
-        current_input, current_count = [], 0
-        req_id = 1
-
-        for text, count in zip(texts, counts):
-            if current_count + count > max_input_tokens and current_input:
-                yield EmbeddingRequest(
-                    id=req_id,
-                    input=current_input,
-                    model=model,
-                    token_count=current_count,
-                )
-                current_input, current_count = [], 0
-                req_id += 1
-
-            current_input.append(text)
-            current_count += count
-
-        if current_input:
-            yield EmbeddingRequest(
-                id=req_id, input=current_input, model=model, token_count=current_count
-            )
-
-    def _batch_texts(
-        self, id: int, texts: list[str], model: str, max_input_tokens: int
-    ) -> list[str]:
-        """
-        Takes a list of texts to embed and split them in multiple batches depending on
-        the API limits: Tokens Per Request > Requests Per Batch > Batch File Size
-        """
-
-        console.print(
-            Panel(
-                f"[bold cyan]Model:[/bold cyan] {model}\n"
-                f"[bold cyan]Total texts:[/bold cyan] {len(texts):,}\n"
-                f"[bold cyan]Max tokens per request:[/bold cyan] {max_input_tokens:,}\n"
-                f"[bold cyan]Max requests per batch:[/bold cyan] {MAX_REQUESTS_PER_BATCH:,}\n",
-                title="[bold]Embedding Configuration[/bold]",
-                border_style="cyan",
-            )
-        )
-
-        logger.info(f"Pre-tokenizing texts for Rate Limits...")
-
-        # Pre-tokenization (parallel workers)
-        token_counts = self._tokenize_texts(texts, model)
-
-        # Process texts into request objects
-        requests = list(
-            self._generate_embedding_request(
-                texts, model, token_counts, max_input_tokens
-            )
-        )
-
-        # Process requests into batch files
-        request_files = [
-            self._create_batch_file(
-                id,
-                BatchRequest(
-                    i,
-                    batch,
-                    sum(len(r.input) for r in batch),
-                    sum(r.token_count for r in batch),
-                ),
-                model,
-            )
-            for i, batch in enumerate(
-                chunk_list(requests, MAX_REQUESTS_PER_BATCH), start=1
-            )
-        ]
-
-        return [f for batch_files in request_files for f in batch_files]
-
-    def _log_batch_request(self, job_id: int, batch_request: Batch, local_file: str):
-        """
-        Takes a Batch request object from the OpenAI API and creates a new record in the local DB.
-        It leverages that Batch is a pydantic model.
-        """
-
-        payload = map_openai_batch_to_dict(batch_request)
-        batch_db = BatchCreate(job_id=job_id, local_file_id=local_file, **payload)
-
-        with get_session() as db:
-            batch = BatchRepository.create_batch(db, batch_db)
-
-        logger.info(f"Created batch request {batch}")
-
-    def _tokenize_texts(
-        self, texts: list[str], model: str, max_workers: int = None
-    ) -> list[int]:
-        """Tokenize texts in parallel using multiprocessing."""
-
-        if max_workers is None:
-            max_workers = os.cpu_count()
-
-        # Chunk size: distribute work evenly across workers
-        chunk_size = max(1, len(texts) // (max_workers * 4))
-        chunks = list(chunk_list(texts, chunk_size))
-
-        logger.info(
-            f"Tokenizing {len(texts):,} texts using {max_workers} workers ({len(chunks)} chunks)..."
-        )
-
-        try:
-            tiktoken.encoding_for_model(model)
-            model_name = model
-        except:
-            logger.warning(
-                f"Could not find a tokenizer in tiktoken for model {model}. Defaulting to `cl100k_base` tokenizer. Token count is approximated!"
-            )
-            # NOTE. Can use AutoTokenizer from HF but there's no need for exact matching tokens (only token count). HF very slow to download models.
-            # encoding = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            model_name = "cl100k_base"
-
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            worker_fn = partial(tokenize, model_name=model_name)
-            results = list(
-                tqdm(
-                    executor.map(worker_fn, chunks),
-                    total=len(chunks),
-                    desc="Tokenizing",
-                )
-            )
-
-        # Flatten results
-        token_counts = [count for chunk_result in results for count in chunk_result]
-
-        return token_counts
-
-    def _parse_texts(self, file: str, text_column: str | list[str]) -> list[str]:
-        """
-        Read texts from the .parquet file using polars and select columns
-        to create the final texts to embed.
-        """
-
-        logger.info(
-            f"Reading data from {file} 🔎\nThis may take a few seconds depending on the size of data..."
-        )
-
-        df = pl.read_parquet(file).head(2_000)  # TODO. Remove .head() in prod
-
-        if isinstance(text_column, list):
-            texts = (
-                df.select(pl.concat_str(text_column, separator="\n\n"))
-                .to_series()
-                .to_list()
-            )
-        else:
-            texts = df[text_column].to_list()
-
-        return texts
+        return self.client.batches.retrieve(batch_oaid)
 
     def _create_job(self, model: str) -> JobRead:
         """Creates a new Job in DB"""
 
         with get_session() as db:
             job = JobRepository.create_job(db, model)
+
+        logger.info(f"New Job {job.id} created for model '{job.model}'")
         return job
 
-    def _check_status_display(
-        self,
-        job: JobRead,
-        batches: list[BatchRead],
-        upd_time: Optional[datetime] = None,
-    ):
-        status_colors = {
-            JobStatus.PENDING: "cyan",
-            JobStatus.PROCESSING: "yellow",
-            JobStatus.COMPLETED: "green",
-            JobStatus.FAILED: "red",
-            BatchStatus.COMPLETED: "green",
-            BatchStatus.VALIDATING: "cyan",
-            BatchStatus.IN_PROGRESS: "yellow",
-            BatchStatus.FAILED: "red",
-            BatchStatus.EXPIRED: "magenta",
-            BatchStatus.CANCELLED: "grey50",
-        }
-
-        job_color = status_colors.get(job.status, "white")
-
-        table = Table(title=f"Batches for Job {job.id}", box=None, show_edge=False)
-        table.add_column("ID", style="cyan")
-        table.add_column("API ID", style="cyan")
-        table.add_column("Status")
-        table.add_column("Completed", style="green")
-        table.add_column("Failed", style="magenta")
-        table.add_column("Total", style="cyan")
-        table.add_column("Errors", style="magenta")
-        table.add_column("Created (UTC)", style="yellow")
-        table.add_column("Updated (UTC)", style="yellow")
-
-        for b in batches:
-            b_color = status_colors.get(b.status, "white")
-
-            table.add_row(
-                str(b.id),
-                b.batch_oaid,
-                f"[{b_color}]{b.status.value}[/]",
-                str(b.request_completed),
-                str(b.request_failed),
-                str(b.request_total),
-                b.errors or "Null",
-                b.created_at.strftime("%d/%m/%Y, %H:%M:%S"),
-                b.calculated_update_at.strftime("%d/%m/%Y, %H:%M:%S"),
-            )
-
-        refresh_info = ""
-        if upd_time is not None:
-            refresh_info = Columns(
-                [
-                    f"[dim]Updating every 1 min. Last update: {upd_time.strftime('%H:%M:%S')}[/] ",
-                    Spinner("point", style="yellow", speed=0.5),
-                ]
-            )
-
-        return Panel(
-            Group(
-                f"Job Status: [bold {job_color}]{job.status.value.upper()}[/]",
-                refresh_info,
-                "",
-                table,
-                "",
-                "[dim italic]Press Enter to exit...[/]",
-            ),
-            title="[bold]Job Monitor[/]",
-            border_style="cyan",
-            expand=False,
-        )
-
-    def _check_status_fetch_and_update(
-        self, job_id: int
-    ) -> tuple[JobRead, list[BatchRead]]:
-        logger.info(f"Updating Batch statuses for [yellow]Job {job_id}[/]")
-
+    def _fetch_model(self, job_id: int) -> str:
         with get_session() as db:
-            batches = BatchRepository.get_batches(db, job_id)
-            upd_batches = []
-            for b in batches:
-                api_batch = self._get_batch_api(b.batch_oaid)
-                upd_data = BatchUpdate.model_validate(
-                    map_openai_batch_to_dict(api_batch)
-                )
-                upd_batches.append(
-                    BatchRepository.update_batch(
-                        db,
-                        b.id,
-                        upd_data,
-                    )
-                )
-
-            job = JobRepository.update_job_status(db, job_id)
-            return job, upd_batches
-
-    async def _check_status_monitor(self, job_id: int, live: Live) -> None:
-        while True:
-            await asyncio.sleep(60)
-            job, upd_batches = self._check_status_fetch_and_update(job_id)
-            live.update(self._check_status_display(job, upd_batches, datetime.now()))
-
-    async def _check_status_async(self, job: JobRead, batches: list[BatchRead]):
-        with Live(
-            self._check_status_display(job, batches, datetime.now()),
-            refresh_per_second=10,
-        ) as live:
-            monitor_task = asyncio.create_task(self._check_status_monitor(job.id, live))
-            exit_task = asyncio.create_task(asyncio.to_thread(input))
-
-            await asyncio.wait(
-                [monitor_task, exit_task], return_when=asyncio.FIRST_COMPLETED
-            )
-            monitor_task.cancel()
+            job = JobRepository.get_job(db, job_id)
+        return job.model
 
     def _download_output_files(self, batches: list[BatchRead]) -> list[Path]:
         progress = Progress(
@@ -581,193 +200,22 @@ class VectorEmbeddings:
         with progress:
             task = progress.add_task("download", total=len(batches))
 
-            with OpenAI(
-                base_url=config("OAI_URL"), api_key=config("OAI_API_KEY")
-            ) as client:
+            out_files = []
 
-                out_files = []
+            for b in batches:
+                fout = b.output_file_id
+                localpath = Path(b.local_file_id)
 
-                for b in batches:
-                    fout = b.output_file_id
-                    localpath = Path(b.local_file_id)
+                fnew = localpath.parent / f"{localpath.stem}_result.jsonl"
+                fnew.parent.mkdir(parents=True, exist_ok=True)
 
-                    fnew = localpath.parent / f"{localpath.stem}_result.jsonl"
-                    fnew.parent.mkdir(parents=True, exist_ok=True)
+                # Stream OAI file to local
+                with self.client.files.with_streaming_response.content(fout) as content:
+                    with open(fnew, "wb") as f:
+                        for chunk in content.iter_bytes():
+                            f.write(chunk)
 
-                    content = client.files.content(fout)
-                    fnew.write_text(content.text, encoding="utf-8")
-
-                    out_files.append(fnew)
-                    progress.advance(task)  # Update progress bar
+                out_files.append(fnew)
+                progress.advance(task)  # Update progress bar
 
         return out_files
-
-    def _parse_output_files(self, files: list[Path]) -> Path:
-        """
-        Parses the OAI Batch API response files containing the mebddings
-        into a single npy file.
-
-        NOTE. This method doesn't know about the total number of vector embeddings
-        requested accross all batches,having to stream the embeddings first into
-        a .raw file and later copying them into a .npy file where the shape is
-        pre-fixed.
-        """
-
-        out_raw = files[0].parents[1] / f'{"-".join(files[0].stem.split("-")[:-2])}.raw'
-        out_npy = out_raw.with_suffix(".npy")
-
-        vec_count = 0
-        for f in files:
-            map_sorted = self._sort_output_file(f)
-            vec_count += self._stream_embs_to_sorted_raw(f, map_sorted, out_raw)
-
-        out_file = self._stream_raw_to_numpy(
-            fraw=out_raw, dims=(vec_count, EMBEDDING_DIM), fout=out_npy
-        )
-
-        os.remove(out_raw)  # delete raw file
-        return out_file
-
-    def _sort_output_file(self, file: Path) -> list[tuple[str, int]]:
-        """
-        Takes an Embedding OAI Batch API response file and sorts its responses
-        based on the "custom_id" field as instructed by the API docs (https://platform.openai.com/docs/guides/batch#:~:text=Note%20that%20the%20output%20line%20order%20may%20not%20match%20the%20input%20line%20order.%20Instead%20of%20relying%20on%20order%20to%20process%20your%20results%2C%20use%20the%20custom_id%20field%20which%20will%20be%20present%20in%20each%20line%20of%20your%20output%20file%20and%20allow%20you%20to%20map%20requests%20in%20your%20input%20to%20results%20in%20your%20output.)
-
-        Args:
-            file: Path to the Batch API response file
-
-        Returns:
-            A list of tuples (custom_id, offset) organised by "custom_id". The offset
-            represents the line position where the response with that ccustom_id starts.
-
-        NOTE. Instead of explicitly sorting the file this function returns a sorted
-        map object that maps the custom_id with the corresponding line in the file,
-        avoiding extra computations.
-        """
-
-        id_pattern = re.compile(rb'"custom_id"\s*:\s*"([^"]+)"')
-        line_map = []  # Contains the custom_id and start line position
-
-        with file.open("rb") as f:
-            while True:
-                offset = f.tell()
-                chunk = f.read(500)  # read only start of line
-
-                if not chunk:
-                    break
-
-                match = id_pattern.search(chunk)
-                if match:
-                    line_map.append((match.group(1).decode("utf-8"), offset))
-
-                f.seek(offset)
-                f.readline()
-
-        line_map.sort(key=lambda x: x[0])
-        return line_map
-
-    def _stream_embs_to_sorted_raw(
-        self, file: Path, map_sorted: list[tuple[str, int]], output_raw: Path
-    ) -> int:
-        """
-        Streams embeddings from the OAI Batch response file to a .raw file in the
-        order they were requested.
-
-        Args:
-            file: Input Path OAI Batch response file
-            map_sorted: Ordered list of tuples containing (custom_id, offset) where
-                custom_id is the sorting key and offset the position of the line where
-                the response for that custom_id start in the Batch response file.
-            output_raw: Output Path to the .raw file (shared accross multiple files)
-
-        Returns:
-            The total count of vectors from the processed file
-        """
-
-        VECTOR_BATCH_SIZE = 1000
-        vec_count = 0
-        vec_batch = []
-
-        # Define the rich progress bar columns
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-        )
-
-        with progress:
-            task_id = progress.add_task(f"Streaming {file.name}", total=len(map_sorted))
-
-            with open(file, "rb") as f_in:
-                # Use mmap to random access file faster
-                with mmap.mmap(f_in.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    with open(output_raw, "ab+") as f_out:
-                        for _, offset in map_sorted:
-                            mm.seek(offset)
-                            line = mm.readline()
-
-                            progress.update(task_id, advance=1)
-
-                            if not line:
-                                continue
-
-                            try:
-                                data = json.loads(line)
-                                items = data["response"]["data"]
-
-                                for i in items:
-                                    vec_batch.append(i["embedding"])
-
-                                    if len(vec_batch) >= VECTOR_BATCH_SIZE:
-                                        arr = np.array(vec_batch, dtype="float32")
-                                        f_out.write(arr.tobytes())
-                                        vec_count += len(vec_batch)
-                                        vec_batch = []
-
-                            except Exception as e:
-                                # Use rich's print to avoid breaking the progress bar layout
-                                progress.console.print(
-                                    f"[red]Error parsing line from {file.name} at offset: {offset} -> {e}[/red]"
-                                )
-
-                        # Final flush
-                        if vec_batch:
-                            arr = np.array(vec_batch, dtype="float32")
-                            f_out.write(arr.tobytes())
-                            vec_count += len(vec_batch)
-
-        return vec_count
-
-    def _stream_raw_to_numpy(self, fraw: Path, dims: tuple[int], fout: Path) -> Path:
-        """
-        Takes a .raw file containing the vector embeddings and streams
-        it into a .npy file with pre-fixed shape. This way embeddings
-        are stored in a more propper and efficient format, as .npy  files
-        contain metadata about the shape and data type.
-        """
-
-        npy = np.lib.format.open_memmap(fout, mode="w+", dtype="float32", shape=dims)
-
-        # Stream raw file in chunks of 100MB
-        chunk_size = 100 * 1024 * 1024
-        rows_per_chunk = chunk_size // (dims[1] * 4)  # float32 = 4 bytes
-
-        with open(fraw, "rb") as f:
-            for start_row in range(0, dims[0], rows_per_chunk):
-                end_row = min(start_row + rows_per_chunk, dims[0])
-                bytes_to_read = (end_row - start_row) * dims[1] * 4
-                raw_chunk = f.read(bytes_to_read)
-                array_chunk = np.frombuffer(raw_chunk, dtype="float32").reshape(
-                    end_row - start_row, dims[1]
-                )
-                npy[start_row:end_row] = array_chunk
-
-        npy.flush()
-        del npy  # delete reference (mmap objects can sometimes keep a file "busy" even after the function ends)
-
-        return fout
-
-
-Embeddings = VectorEmbeddings()
